@@ -21,7 +21,8 @@ class Task(InferenceTask):
         load_dotenv(path.join(dirname(__file__), ".env"))
         self._client = AsyncOpenAI(
             api_key=os.environ["API_KEY"],
-            base_url=os.environ["BASE_URL"]
+            base_url=os.environ["BASE_URL"],
+            timeout=None
         )
 
     def get_length(self) -> int:
@@ -33,6 +34,10 @@ class Task(InferenceTask):
         self._db.close()
 
     async def process(self, data, order: int, sem: Semaphore, bar: tqdm.tqdm):
+        # id列に order の値が存在するか確認、したらスキップ
+        if self._cur.execute("SELECT COUNT(*) FROM result WHERE id=?;", (order,)).fetchone()[0] > 0:
+            bar.update(1)
+            return
         async with sem:
             input_json = data["messages"]
             output_json = [
