@@ -32,7 +32,7 @@ async def main():
         task_queue.add(asyncio.create_task(task.process(item, order, semaphore, bar)))
         if task_queue.__len__() > args.concurrency * 2:
             while task_queue.__len__() > args.concurrency * 1.5:
-                _, task_queue = await asyncio.wait(task_queue, timeout=0.5)
+                _, task_queue = await asyncio.wait(task_queue, timeout=3)
     await asyncio.wait(task_queue)
 
 
