@@ -24,11 +24,11 @@ A tool to stream datasets from HuggingFace and perform parallel inference using 
 Run the inference for a specific project using `uv run`:
 
 ```bash
-uv run main.py --project example --limit 10
+uv run main.py --project example ----concurrency 10
 ```
 
 - `--project`: name of the directory in `projects/`
-- `--limit`: (Optional) limit the number of records to process
+- `----concurrency`: (Optional) limit the number of records to process
 
 ## Example Project
 
@@ -37,10 +37,7 @@ See `projects/example/` for a reference implementation.
 ### Configuration (`.env`)
 
 ```env
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.openai.com/v1
-MODEL_NAME=gpt-3.5-turbo
-DATASET_NAME=tatsu-lab/alpaca
-DATASET_SPLIT=train
-MAX_CONCURRENCY=5
+BASE_URL=http://localhost:30000/v1
+API_KEY=EMPTY
+MODEL_NAME=zai-org/GLM-4.7-FP8
 ```
