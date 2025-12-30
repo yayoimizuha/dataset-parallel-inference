@@ -64,6 +64,7 @@ class Task(InferenceTask):
                         messages=output_json,
                         model=os.environ["MODEL_NAME"]
                         )
+                        break
                     except OpenAIError as e:
                         # if sleep_time > 16.0:
                         #     output_json.append({"role": "assistant", "content": ""})
