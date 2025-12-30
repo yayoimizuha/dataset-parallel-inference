@@ -69,7 +69,7 @@ class Task(InferenceTask):
                     except OpenAIError as e:
                         if sleep_time > 16.0:
                             output_json.append({"role": "assistant", "content": "<-- 空のダミー出力 -->"})
-                            continue
+                            break
                         print(f"OpenAI API Error: {e}")
                         await asyncio.sleep(sleep_time)
                         sleep_time *= 2
