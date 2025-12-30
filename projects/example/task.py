@@ -47,11 +47,12 @@ class Task(InferenceTask):
                     "content": "外国語の文章と、日本語の文章のペアが与えられるので、外国語の文章を全て日本語に翻訳してください。なお、以下の条件を守ってください。\n"
                                " - 人名は翻訳せず、原文の表記のまま用いること。\n"
                                " - 原文に忠実に翻訳し、原文に存在する情報を欠落させたり、原文に書いていないことを勝手に付け加えないこと。\n"
-                               " - 原文の雰囲気・文脈に基づいて翻訳すること。"
+                               " - 原文の雰囲気・文脈に基づいて翻訳すること。\n"
+                               " - 翻訳済みの文章のみを出力し、余計な説明や注釈を加えないこと。"
                 }
             ]
             for message in input_json:
-                output_json.append(message)
+                output_json.append(message.copy())
                 output_json[-1].update(role="user")
                 if output_json[-1]["content"] == "":
                     output_json[-1].update(content="<-- empty dummy input -->")
