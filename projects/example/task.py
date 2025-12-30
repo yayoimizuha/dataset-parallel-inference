@@ -56,7 +56,7 @@ class Task(InferenceTask):
                 if output_json[-1]["content"] == "":
                     output_json.append({"role": "assistant", "content": ""})
                     continue
-                sleep_time = 1.0
+                sleep_time = 4.0
                 while True:
                     try:
                         resp = await self._client.chat.completions.create(
@@ -64,9 +64,9 @@ class Task(InferenceTask):
                         model=os.environ["MODEL_NAME"]
                         )
                     except OpenAIError as e:
-                        if sleep_time > 16.0:
-                            output_json.append({"role": "assistant", "content": ""})
-                            continue
+                        # if sleep_time > 16.0:
+                        #     output_json.append({"role": "assistant", "content": ""})
+                        #     continue
                         print(f"OpenAI API Error: {e}")
                         await asyncio.sleep(sleep_time)
                         sleep_time *= 2
