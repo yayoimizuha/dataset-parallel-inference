@@ -54,7 +54,8 @@ class Task(InferenceTask):
                 output_json.append(message)
                 output_json[-1].update(role="user")
                 if output_json[-1]["content"] == "":
-                    output_json.append({"role": "assistant", "content": ""})
+                    output_json[-1].update(content="<-- empty dummy input -->")
+                    output_json.append({"role": "assistant", "content": "<-- 空のダミー出力 -->"})
                     continue
                 sleep_time = 4.0
                 while True:
