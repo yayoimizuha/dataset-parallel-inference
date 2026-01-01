@@ -8,7 +8,7 @@ import tqdm
 from datasets import load_dataset
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAIError
-from openai.types.chat import ChatCompletionSystemMessageParam,ChatCompletionUserMessageParam
+from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 
 from core import InferenceTask
 from asyncio import Semaphore
@@ -50,13 +50,14 @@ class Task(InferenceTask):
                 sleep_time = 4.0
                 while True:
                     try:
-                        chat_string = "\n\n\n".join([
+                        chat_string = "\n\n\n".join(filter(None,[
                             f"===={orig['role']}=============\n" +
                             orig['content'] +
                             "\n\n↓\n\n" +
                             trans['content']
-                            for orig,trans in zip(original_messages,translated_messages)
-                        ])
+                            if orig["content"] != "" else None for orig, trans in
+                            zip(original_messages, translated_messages)
+                        ]))
                         "以下に外国語の文章が与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n"
                         "\n"
                         " - 人名については翻訳せず、原文での表記のまま書くこと。\n"

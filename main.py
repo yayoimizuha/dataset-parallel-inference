@@ -28,7 +28,7 @@ async def main():
     semaphore = Semaphore(value=args.concurrency)
     bar = tqdm.tqdm(total=task.get_length())
     task_queue = set()
-    for (order, item) in enumerate(iter(task.dataset)):
+    for (order, item) in enumerate([next(iter(task.dataset))]):
         task_queue.add(asyncio.create_task(task.process(item, order, semaphore, bar)))
         if task_queue.__len__() > args.concurrency * 2:
             while task_queue.__len__() > args.concurrency * 1.5:
