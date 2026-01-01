@@ -53,20 +53,20 @@ class Task(InferenceTask):
                         chat_string = "\n\n\n".join(filter(None,[
                             f"===={orig['role']}=============\n" +
                             orig['content'] +
-                            "\n\n↓\n\n" +
-                            trans['content']
+                            "\n\n-------↓↓↓↓↓↓-------\n\n" +
+                            trans['content'] +
+                            "\n============================="
                             if orig["content"] != "" else None for orig, trans in
                             zip(original_messages, translated_messages)
-                        ]))
-                        "以下に外国語の文章が与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n"
-                        "\n"
-                        " - 人名については翻訳せず、原文での表記のまま書くこと。\n"
-                        " - 原文に忠実に翻訳し、原文に存在する情報を欠落させたり、書かれていないことを付け加えないこと。\n"
-                        " - 原文の雰囲気や文脈に基づいて翻訳すること。\n"
-                        " - 翻訳済みの文章のみを出力し、余計な説明や注釈を加えないこと。\n\n"
-                        "====================\n"
-                        str(message["content"])
-                        print(f"{chat_string}")
+                        ])) + "\n\n\n\n" + \
+                        "以下に外国語の文章が与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n" + \
+                        "\n" + \
+                        " - 人名については翻訳せず、原文での表記のまま書くこと。\n" + \
+                        " - 原文に忠実に翻訳し、原文に存在する情報を欠落させたり、書かれていないことを付け加えないこと。\n" + \
+                        " - 原文の雰囲気や文脈に基づいて翻訳すること。\n" + \
+                        " - 翻訳済みの文章のみを出力し、余計な説明や注釈を加えないこと。\n\n" + \
+                        "\n=============================\n" + str(message["content"])
+                        # print(f"{chat_string}")
 
                         resp = await self._client.chat.completions.create(
                             messages=[
