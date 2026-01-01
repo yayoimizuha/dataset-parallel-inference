@@ -57,7 +57,7 @@ class Task(InferenceTask):
                             "\n\n-------↓↓↓↓↓↓-------\n\n" +
                             trans['content'] +
                             "\n============================="
-                            if orig["content"] != "" else None for orig, trans in
+                            if (orig["content"] or "") != "" else None for orig, trans in
                             zip(original_messages, translated_messages)
                         ])) + "\n\n\n\n" + \
                         "以下に外国語の文章Aが与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n" + \
