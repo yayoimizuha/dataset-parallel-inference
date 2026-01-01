@@ -53,9 +53,9 @@ class Task(InferenceTask):
                         chat_string = "過去の会話履歴(一貫性のある翻訳のためのコンテキスト):\n\n\n" + \
                             "\n\n\n".join(filter(None,[
                             f"===={orig['role']}=============\n" +
-                            orig['content'] +
+                            (orig['content'] or "") +
                             "\n\n-------↓↓↓↓↓↓-------\n\n" +
-                            trans['content'] +
+                            (trans['content'] or "") +
                             "\n============================="
                             if (orig["content"] or "") != "" else None for orig, trans in
                             zip(original_messages, translated_messages)
