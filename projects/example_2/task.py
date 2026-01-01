@@ -36,7 +36,7 @@ class Task(InferenceTask):
         if self._cur.execute("SELECT COUNT(*) FROM result WHERE id=?;", (order,)).fetchone()[0] > 0:
             bar.update(1)
             return
-        async with (sem):
+        async with ((sem)):
             input_json = data["messages"]
 
             original_messages = []
@@ -50,7 +50,8 @@ class Task(InferenceTask):
                 sleep_time = 4.0
                 while True:
                     try:
-                        chat_string = "\n\n\n".join(filter(None,[
+                        chat_string = "過去の会話履歴(一貫性のある翻訳のためのコンテキスト):\n\n\n" + \
+                            "\n\n\n".join(filter(None,[
                             f"===={orig['role']}=============\n" +
                             orig['content'] +
                             "\n\n-------↓↓↓↓↓↓-------\n\n" +
@@ -59,13 +60,13 @@ class Task(InferenceTask):
                             if orig["content"] != "" else None for orig, trans in
                             zip(original_messages, translated_messages)
                         ])) + "\n\n\n\n" + \
-                        "以下に外国語の文章が与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n" + \
+                        "以下に外国語の文章Aが与えられます。その文章を全て日本語に翻訳してください。なお、以下の条件を**遵守**すること。\n" + \
                         "\n" + \
                         " - 人名については翻訳せず、原文での表記のまま書くこと。\n" + \
                         " - 原文に忠実に翻訳し、原文に存在する情報を欠落させたり、書かれていないことを付け加えないこと。\n" + \
                         " - 原文の雰囲気や文脈に基づいて翻訳すること。\n" + \
                         " - 翻訳済みの文章のみを出力し、余計な説明や注釈を加えないこと。\n\n" + \
-                        "\n=============================\n" + str(message["content"])
+                        "\n===文章A==========================\n\n\n" + str(message["content"])
                         # print(f"{chat_string}")
 
                         resp = await self._client.chat.completions.create(
