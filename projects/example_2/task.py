@@ -36,7 +36,7 @@ class Task(InferenceTask):
         if self._cur.execute("SELECT COUNT(*) FROM result WHERE id=?;", (order,)).fetchone()[0] > 0:
             bar.update(1)
             return
-        async with ((sem)):
+        async with sem:
             input_json = data["messages"]
 
             original_messages = []
