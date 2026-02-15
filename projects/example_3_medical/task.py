@@ -27,6 +27,7 @@ class Task(InferenceTask):
         self._cur.execute(f"CREATE TABLE IF NOT EXISTS result(id INT PRIMARY KEY,content TEXT,source TEXT,reasoning TEXT);")
         self._replace_keys = ["prompt", "reward_model", "Rubrics:reward_model.rubrics"]
         self._long_str_threshold = 2500
+        self._extremely_long_prompt_threshold = 10000
         load_dotenv(path.join(dirname(__file__), ".env"))
         self._client = AsyncOpenAI(api_key=os.environ["API_KEY"], base_url=os.environ["BASE_URL"], timeout=None)
         self._temperature = 0.5
@@ -177,6 +178,12 @@ class Task(InferenceTask):
             except (KeyError, ValueError):
                 # "Rubrics" がデコードできないか存在しない場合は "prompts" と "reward_model" を取得
                 input_json_str = json.dumps({"prompt": data["prompt"], "reward_model": data["reward_model"]}, ensure_ascii=False, separators=(",", ":"))
+        
+        # 極端に長いプロンプトをスキップ
+        if len(input_json_str) > self._extremely_long_prompt_threshold:
+            print(f"order[{order}]: Skipping extremely long prompt (length: {len(input_json_str)})")
+            bar.update(1)
+            return
                 
         original_obj = data.copy()
         
