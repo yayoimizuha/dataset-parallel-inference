@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Dataset Statistics Script for RubricHub_v1_config datasets
+Dataset Statistics Script for Hugging Face datasets
 
 This script analyzes and outputs statistical information about the prompt lengths
-in all example_3 series datasets (chat, writing, medical, science, follow).
+in datasets. It automatically detects available subsets from the dataset metadata.
 
 Usage:
     python dataset_statistics.py <dataset_name> [subset]
     
-    If dataset_name is provided, analyzes only that dataset
+    If dataset_name is provided, analyzes all available subsets
     If subset is also provided, analyzes only that specific subset
-    If no arguments, analyzes all datasets
 
 Output includes:
 - Count, mean, variance, standard deviation
@@ -21,19 +20,10 @@ Output includes:
 
 import json
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, get_dataset_config_names
 from typing import Dict, List, Tuple, Optional
 import sys
 import argparse
-
-
-ALL_DATASET_CONFIGS = [
-    "chat",
-    "writing", 
-    "medical",
-    "science",
-    "follow"
-]
 
 
 def calculate_prompt_length(data: dict) -> int:
@@ -187,11 +177,11 @@ def print_summary_table(all_stats: Dict[str, Dict], all_lengths: Dict[str, List[
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Analyze dataset statistics for RubricHub_v1_config datasets',
+        description='Analyze dataset statistics for Hugging Face datasets (automatically detects available subsets)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python dataset_statistics.py NovelHacja/RubricHub_v1_config           # Analyze all subsets
+  python dataset_statistics.py NovelHacja/RubricHub_v1_config           # Analyze all available subsets
   python dataset_statistics.py NovelHacja/RubricHub_v1_config chat      # Analyze only chat subset
   python dataset_statistics.py NovelHacja/RubricHub_v1_config writing   # Analyze only writing subset
         """
@@ -199,19 +189,28 @@ Examples:
     parser.add_argument('dataset_name', type=str, 
                         help='Dataset name (e.g., NovelHacja/RubricHub_v1_config)')
     parser.add_argument('subset', type=str, nargs='?', default=None,
-                        help='Optional: specific subset to analyze (e.g., chat, writing, medical, science, follow)')
+                        help='Optional: specific subset to analyze. If not provided, all available subsets will be analyzed.')
     
     args = parser.parse_args()
     
+    # Get available configs from the dataset metadata
+    try:
+        print(f"Retrieving available subsets for {args.dataset_name}...", file=sys.stderr)
+        available_configs = get_dataset_config_names(args.dataset_name)
+        print(f"Found {len(available_configs)} subsets: {', '.join(available_configs)}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error retrieving dataset configs: {e}", file=sys.stderr)
+        sys.exit(1)
+    
     # Determine which configs to analyze
     if args.subset:
-        if args.subset not in ALL_DATASET_CONFIGS:
+        if args.subset not in available_configs:
             print(f"Error: Unknown subset '{args.subset}'", file=sys.stderr)
-            print(f"Available subsets: {', '.join(ALL_DATASET_CONFIGS)}", file=sys.stderr)
+            print(f"Available subsets: {', '.join(available_configs)}", file=sys.stderr)
             sys.exit(1)
         dataset_configs = [args.subset]
     else:
-        dataset_configs = ALL_DATASET_CONFIGS
+        dataset_configs = available_configs
     
     all_stats = {}
     all_lengths = {}

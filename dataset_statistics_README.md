@@ -10,7 +10,7 @@
 python3 dataset_statistics.py NovelHacja/RubricHub_v1_config
 ```
 
-これにより、全てのサブセット（chat, writing, medical, science, follow）が分析されます。
+これにより、データセットのメタデータから自動的に検出された全てのサブセットが分析されます。
 
 ### 特定のサブセットのみ分析
 
@@ -89,6 +89,10 @@ pip install numpy
 3. それも失敗した場合は`prompt`と`reward_model`のみから生成
 
 これにより、実際の処理時と同じ方法でプロンプト長が計算されます。
+
+### サブセットの自動検出
+
+スクリプトは、Hugging Face Datasets APIの`get_dataset_config_names()`関数を使用して、データセットのメタデータから利用可能なサブセットを自動的に検出します。これにより、ハードコードされたリストを使用せず、どのようなデータセットにも対応できます。
 
 ## 注意事項
 
