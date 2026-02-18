@@ -100,7 +100,7 @@ class Task(InferenceTask):
                             response_format=TranslationElaboration,
                         )
                         if resp_1.choices[0].message.parsed is None:
-                            raise OpenAIError(f"Failed to parse TranslationElaboration response from resp_1. Expected structured output with 'elaboration' field.")
+                            raise OpenAIError("Failed to parse TranslationElaboration response from resp_1. Expected structured output with 'elaboration' field.")
                         
                         resp_2 = await self._client.chat.completions.parse(
                             messages=[
@@ -114,7 +114,7 @@ class Task(InferenceTask):
                             response_format=TranslationResult,
                         )
                         if resp_2.choices[0].message.parsed is None:
-                            raise OpenAIError(f"Failed to parse TranslationResult response from resp_2. Expected structured output with 'translation' field.")
+                            raise OpenAIError("Failed to parse TranslationResult response from resp_2. Expected structured output with 'translation' field.")
                         break
                     except (OpenAIError, ValueError) as e:
                         if sleep_time > 32.0:
