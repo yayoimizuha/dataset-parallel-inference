@@ -78,7 +78,7 @@ class Task(InferenceTask):
                 sleep_time = 4.0
                 while True:
                     try:
-                        resp_1 = await self._client.chat.completions.create(
+                        resp_1 = await self._client.chat.responses.create(
                             messages=[
                                 ChatCompletionUserMessageParam(
                                     content=prompt,
@@ -89,7 +89,7 @@ class Task(InferenceTask):
                             extra_body={"separate_reasoning": True},
                             reasoning_effort="none",
                         )
-                        resp_2 = await self._client.chat.completions.create(
+                        resp_2 = await self._client.chat.responses.create(
                             messages=[
                                 {"role": "user", "content": prompt},
                                 {"role": "assistant", "content": resp_1.choices[0].message.content},
