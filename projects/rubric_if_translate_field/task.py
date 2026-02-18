@@ -12,19 +12,8 @@ import tqdm
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionAssistantMessageParam
-from pydantic import BaseModel
 from core import InferenceTask
 from asyncio import Semaphore
-
-
-class TranslationElaboration(BaseModel):
-    """Model for the translation elaboration/reasoning response."""
-    elaboration: str
-
-
-class TranslationResult(BaseModel):
-    """Model for the final translation result."""
-    translation: str
 
 
 class Task(InferenceTask):
@@ -89,32 +78,27 @@ class Task(InferenceTask):
                 sleep_time = 4.0
                 while True:
                     try:
-                        resp_1 = await self._client.chat.completions.parse(
-                            messages=[ChatCompletionUserMessageParam(
-                                content=prompt,
-                                role="user"
-                            )],
+                        resp_1 = await self._client.chat.completions.create(
+                            messages=[
+                                ChatCompletionUserMessageParam(
+                                    content=prompt,
+                                    role="user"
+                                )
+                            ],
                             model=os.environ["MODEL_NAME"],
                             extra_body={"separate_reasoning": True},
                             reasoning_effort="none",
-                            response_format=TranslationElaboration,
                         )
-                        if resp_1.choices[0].message.parsed is None:
-                            raise OpenAIError("Failed to parse TranslationElaboration response from resp_1. Expected structured output with 'elaboration' field.")
-                        
-                        resp_2 = await self._client.chat.completions.parse(
+                        resp_2 = await self._client.chat.completions.create(
                             messages=[
                                 {"role": "user", "content": prompt},
-                                {"role": "assistant", "content": resp_1.choices[0].message.parsed.elaboration},
+                                {"role": "assistant", "content": resp_1.choices[0].message.content},
                                 {"role": "user", "content": "推敲をもとに、全文の和訳のみを出力してください。"}
                             ],
                             model=os.environ["MODEL_NAME"],
                             extra_body={"separate_reasoning": True},
                             reasoning_effort="none",
-                            response_format=TranslationResult,
                         )
-                        if resp_2.choices[0].message.parsed is None:
-                            raise OpenAIError("Failed to parse TranslationResult response from resp_2. Expected structured output with 'translation' field.")
                         break
                     except (OpenAIError, ValueError) as e:
                         if sleep_time > 32.0:
@@ -123,8 +107,8 @@ class Task(InferenceTask):
                             return
                         await asyncio.sleep(sleep_time)
                         sleep_time *= 2
-                _contents.append(resp_2.choices[0].message.parsed.translation)
-                _reasons.append(resp_1.choices[0].message.parsed.elaboration)
+                _contents.append(resp_2.choices[0].message.content)
+                _reasons.append(resp_1.choices[0].message.content)
             self._cur.execute("REPLACE INTO translate(id, content, reason) VALUES (?,?,?);", (
                 order,
                 json.dumps(_contents, ensure_ascii=False),
