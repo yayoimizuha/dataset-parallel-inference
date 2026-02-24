@@ -144,7 +144,7 @@ class Task(InferenceTask):
                             },
                             temperature=0.8,
                             top_p=0.95,
-                            reasoning_effort="none",
+                            # reasoning_effort="none",
                         )
 
                         prompts.append(ChatCompletionAssistantMessageParam(
@@ -164,7 +164,7 @@ class Task(InferenceTask):
                             },
                             temperature=0.8,
                             top_p=0.95,
-                            reasoning_effort="none",
+                            # reasoning_effort="none",
                         )
                         prompts.append(ChatCompletionAssistantMessageParam(
                             content=resp_2.choices[0].message.content,
@@ -183,7 +183,7 @@ class Task(InferenceTask):
                             },
                             temperature=0.6,
                             top_p=0.8,
-                            reasoning_effort="none",
+                            # reasoning_effort="none",
                         )
                         break
                     except (OpenAIError, ValueError) as e:

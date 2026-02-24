@@ -61,7 +61,7 @@ class Task(InferenceTask):
         self._client = AsyncOpenAI(api_key=os.environ["API_KEY"], base_url=os.environ["BASE_URL"], timeout=None)
         self.function_definitions = _parse_function_definitions(
             Path(__file__).parent.parent.joinpath("rubric_if_define_field", "functions").glob("*.py"))
-        self.dataset = load_dataset("NovelHacja/RubricHub_v1_config", "instruction_following", split="train",
+        self.dataset = load_dataset("NovelHacja/RubricHub_v1_config", "medical", split="train",
                                     streaming=False)
         load_dotenv(path.join(dirname(__file__), ".env"))
 
