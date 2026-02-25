@@ -23,6 +23,7 @@ dependencies = [
     "more-itertools",
     "semchunk",
     "fugashi",
+    "unidic-lite"
 ]
 
 [build-system]
