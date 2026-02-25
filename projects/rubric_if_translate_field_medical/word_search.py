@@ -84,6 +84,13 @@ class MedicalTermSearcher:
         self._sparse_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sparse")
         self._io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io")
 
+    def close(self) -> None:
+        """リソースを明示的に解放する。"""
+        self._dense_executor.shutdown(wait=False)
+        self._sparse_executor.shutdown(wait=False)
+        self._io_executor.shutdown(wait=False)
+        self.qdrant_db.close()
+
     # ------------------------------------------------------------------
     # エンコード（同期メソッド — スレッドプールから呼ばれる）
     # ------------------------------------------------------------------
@@ -359,5 +366,8 @@ class MedicalTermSearcher:
 
 if __name__ == '__main__':
     searcher = MedicalTermSearcher()
-    asyncio.run(searcher.register_medical_terms())
-    asyncio.run(searcher.search_medical_term("juxtaglomerular apparatus"))
+    try:
+        asyncio.run(searcher.register_medical_terms())
+        asyncio.run(searcher.search_medical_term("juxtaglomerular apparatus"))
+    finally:
+        searcher.close()
