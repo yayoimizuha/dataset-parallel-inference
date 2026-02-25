@@ -49,14 +49,14 @@ class MedicalTermSearcher:
             "cl-nagoya/ruri-v3-310m",
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
-            device="cuda:0",
+            device_map="cuda:0",
         )
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
             "hotchpotch/japanese-splade-v2",
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
-            device="cuda:1",
+            device_map="cuda:1",
         )
         # noinspection PyTypeChecker
         self._yasem = yasem.SpladeEmbedder(
