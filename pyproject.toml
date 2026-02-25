@@ -35,19 +35,15 @@ override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29", "xgrammar==0.1.31"]
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
-explicit = true
+explicit = false
 
 [tool.uv.sources]
 sglang = { git = "https://github.com/sgl-project/sglang.git", subdirectory = "python", branch = "main" }
 torch = { index = "pytorch-cu129" }
 
 [tool.uv.extra-build-dependencies]
-deep_ep = ["torch", "nvidia-nvshmem-cu12", "numpy", "setuptools"]
-deep_gemm = ["torch", "nvidia-nvshmem-cu12", "numpy", "setuptools"]
 flash_attn = ["torch", "einops", "ninja", "setuptools"]
 
 [tool.uv.extra-build-variables]
-"deep_ep" = { TORCH_CUDA_ARCH_LIST = "9.0", NVSHMEM_DIR = "/home/apacsc14/projects/.venv/lib/python3.12/site-packages/nvidia/nvshmem", MAX_JOBS = "8" }
-"deep_gemm" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "8" }
 "flash_attn" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
 "vllm" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
