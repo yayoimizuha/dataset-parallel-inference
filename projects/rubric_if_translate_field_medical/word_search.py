@@ -74,8 +74,10 @@ def _mean_pooling(model_output, attention_mask) -> torch.Tensor:
 
 
 def _ensure_collection(qdrant: QdrantClient) -> None:
-    """コレクションが存在しなければ作成する。"""
-    if not qdrant.collection_exists(_COLLECTION_NAME):
+    """コレクションが存在しなければ作成する。複数プロセスからの同時呼び出しに対応。"""
+    if qdrant.collection_exists(_COLLECTION_NAME):
+        return
+    try:
         qdrant.create_collection(
             _COLLECTION_NAME,
             vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
@@ -85,6 +87,10 @@ def _ensure_collection(qdrant: QdrantClient) -> None:
                 )
             },
         )
+    except Exception:
+        # 別プロセスが先に作成した場合は無視
+        if not qdrant.collection_exists(_COLLECTION_NAME):
+            raise
 
 
 def _send_batch(batch_id: int, batch_buf: list[dict[str, Any]], *queues: mp.Queue) -> None:
