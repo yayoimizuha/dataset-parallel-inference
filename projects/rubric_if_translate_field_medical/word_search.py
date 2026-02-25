@@ -1,10 +1,21 @@
+"""
+4-process pipeline for medical term registration into Qdrant.
+
+Process 1 (dataset_loader): Dataset read + chunking + duplicate check -> sends to P2, P3, P4
+Process 2 (dense_encoder):  Dense vector generation on cuda:0 -> sends to P4
+Process 3 (sparse_encoder): Sparse vector generation on cuda:1 -> sends to P4
+Process 4 (qdrant_writer):  Merges dense+sparse+meta results, upserts to Qdrant
+"""
 import json
+import threading
 import uuid
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import semchunk
 import torch
+import torch.multiprocessing as mp
 # noinspection PyPep8Naming
 import torch.nn.functional as F
 import tqdm
@@ -13,88 +24,445 @@ from datasets import load_dataset
 from qdrant_client import QdrantClient, models
 from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer, BitsAndBytesConfig
 
+# ======================================================================
+# 定数
+# ======================================================================
+
 _CHUNK_SIZE = 512
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-# 各フェーズのバッチサイズ（メモリに余裕があるので大きく取る）
 _DENSE_BATCH_SIZE = 4096
 _SPARSE_BATCH_SIZE = 4096
 _UPSERT_BATCH_SIZE = 10000
+_LOADER_BATCH_SIZE = 2048
 
+_QDRANT_DB_PATH = Path(__file__).parent.joinpath("qdrant_db").as_posix()
+_COLLECTION_NAME = "medical_terms"
+
+_DENSE_MODEL = "cl-nagoya/ruri-v3-310m"
+_SPARSE_MODEL = "hotchpotch/japanese-splade-v2"
+_DATASET_NAME = "omarkamali/wikipedia-monthly"
+_DATASET_CONFIG = "latest.en"
+
+
+class _Sentinel:
+    """pickle 可能なパイプライン終了シグナル。"""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __reduce__(self):
+        return (self.__class__, ())
+
+
+SENTINEL = _Sentinel()
+
+
+# ======================================================================
+# ユーティリティ
+# ======================================================================
 
 def _mean_pooling(model_output, attention_mask) -> torch.Tensor:
-    token_embeddings = model_output.last_hidden_state  # [B, seq_len, 768]
-    mask_expanded = attention_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
-    sum_embeddings = (token_embeddings * mask_expanded).sum(1)  # [B, 768]
-    sum_mask = mask_expanded.sum(1).clamp(min=1e-9)  # [B, 1]
-    return sum_embeddings / sum_mask  # [B, 768]
+    token_embeddings = model_output.last_hidden_state
+    mask_expanded = attention_mask.unsqueeze(-1).float()
+    sum_embeddings = (token_embeddings * mask_expanded).sum(1)
+    sum_mask = mask_expanded.sum(1).clamp(min=1e-9)
+    return sum_embeddings / sum_mask
 
+
+def _ensure_collection(qdrant: QdrantClient) -> None:
+    """コレクションが存在しなければ作成する。"""
+    if not qdrant.collection_exists(_COLLECTION_NAME):
+        qdrant.create_collection(
+            _COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
+            sparse_vectors_config={
+                "splade": models.SparseVectorParams(
+                    index=models.SparseIndexParams(full_scan_threshold=1000)
+                )
+            },
+        )
+
+
+def _send_batch(batch_id: int, batch_buf: list[dict[str, Any]], *queues: mp.Queue) -> None:
+    """同一バッチを複数の Queue へ送信する。"""
+    msg = (batch_id, batch_buf)
+    for q in queues:
+        q.put(msg)
+
+
+# ======================================================================
+# Process 1: Dataset loader
+# ======================================================================
+
+def dataset_loader(
+    to_dense_q: mp.Queue,
+    to_sparse_q: mp.Queue,
+    to_writer_q: mp.Queue,
+) -> None:
+    """
+    Wikipedia データセットを読み込み、チャンク分割・未登録チェックを行い、
+    バッチ単位で P2 (dense), P3 (sparse), P4 (メタデータ) へ送信する。
+    """
+    print("[P1] Starting dataset loader...")
+
+    qdrant = QdrantClient(path=_QDRANT_DB_PATH)
+    _ensure_collection(qdrant)
+
+    wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
+    splade_tokenizer = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
+    # noinspection PyTypeChecker
+    chunker = semchunk.chunkerify(splade_tokenizer, chunk_size=_CHUNK_SIZE)
+
+    total = wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
+    batch_buf: list[dict[str, Any]] = []
+    batch_id = 0
+    sent_chunks = 0
+
+    _item: dict
+    for _item in tqdm.tqdm(wiki_dataset, total=total, desc="[P1] Chunking"):  # type: ignore[assignment]
+        _data_id: str = _item["id"]
+        _title: str = _item["title"]
+        _text: str = _item["text"]
+
+        _chunks: list[str] = chunker(_text)
+        _point_ids = [
+            str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{ci}"))
+            for ci in range(len(_chunks))
+        ]
+
+        _existing = qdrant.retrieve(
+            _COLLECTION_NAME, ids=_point_ids, with_payload=False, with_vectors=False,
+        )
+        _existing_ids = {p.id for p in _existing}
+
+        for ci, (_chunk, _pid) in enumerate(zip(_chunks, _point_ids)):
+            if _pid in _existing_ids:
+                continue
+            batch_buf.append({
+                "point_id": _pid,
+                "article_id": _data_id,
+                "title": _title,
+                "chunk_text": _chunk,
+                "chunk_index": ci,
+            })
+            if len(batch_buf) >= _LOADER_BATCH_SIZE:
+                _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
+                sent_chunks += len(batch_buf)
+                print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})")
+                batch_id += 1
+                batch_buf = []
+
+    # 残りを送信
+    if batch_buf:
+        _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
+        sent_chunks += len(batch_buf)
+        print(f"[P1] Sent final batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})")
+
+    # 終了シグナル
+    for q in (to_dense_q, to_sparse_q, to_writer_q):
+        q.put(SENTINEL)
+
+    qdrant.close()
+    print(f"[P1] Done. Total {sent_chunks} chunks sent.")
+
+
+# ======================================================================
+# Process 2: Dense encoder (cuda:0)
+# ======================================================================
+
+def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
+    """ruri-v3-310m で dense ベクトルを生成し、結果を P4 へ送る。"""
+    print("[P2] Starting dense encoder on cuda:0...")
+
+    tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
+    model = AutoModel.from_pretrained(
+        _DENSE_MODEL,
+        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        trust_remote_code=True,
+        device_map="cuda:0",
+    )
+
+    def encode(texts: list[str]) -> np.ndarray:
+        encoded = tokenizer(
+            texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
+        )
+        if hasattr(model, "device"):
+            encoded = {k: v.to(model.device) for k, v in encoded.items()}
+        with torch.no_grad():
+            output = model(**encoded)
+        emb = _mean_pooling(output, encoded["attention_mask"])
+        emb = F.normalize(emb, p=2, dim=1)
+        return emb.cpu().float().numpy()
+
+    while True:
+        item = in_q.get()
+        if isinstance(item, _Sentinel):
+            out_q.put(SENTINEL)
+            break
+
+        batch_id, chunk_dicts = item
+        texts = [f"検索文書: {d['chunk_text']}" for d in chunk_dicts]
+
+        all_embs = [
+            encode(texts[i: i + _DENSE_BATCH_SIZE])
+            for i in range(0, len(texts), _DENSE_BATCH_SIZE)
+        ]
+        out_q.put((batch_id, np.concatenate(all_embs, axis=0)))
+        print(f"[P2] Dense batch {batch_id} done ({len(texts)} chunks)")
+
+    torch.cuda.empty_cache()
+    print("[P2] Done.")
+
+
+# ======================================================================
+# Process 3: Sparse encoder (cuda:1)
+# ======================================================================
+
+def sparse_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
+    """japanese-splade-v2 で sparse ベクトルを生成し、結果を P4 へ送る。"""
+    print("[P3] Starting sparse encoder on cuda:1...")
+
+    splade_model = AutoModelForMaskedLM.from_pretrained(
+        _SPARSE_MODEL,
+        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        trust_remote_code=True,
+        device_map="cuda:1",
+    )
+    # noinspection PyTypeChecker
+    splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
+    splade_embedder.model = splade_model
+
+    def encode(texts: list[str]) -> list[dict]:
+        sparse_matrix = splade_embedder.encode(texts, convert_to_csr_matrix=True)
+        return [
+            {"indices": sparse_matrix.getrow(i).indices.tolist(),
+             "values": sparse_matrix.getrow(i).data.tolist()}
+            for i in range(sparse_matrix.shape[0])
+        ]
+
+    while True:
+        item = in_q.get()
+        if isinstance(item, _Sentinel):
+            out_q.put(SENTINEL)
+            break
+
+        batch_id, chunk_dicts = item
+        texts = [d["chunk_text"] for d in chunk_dicts]
+
+        all_sparse: list[dict] = []
+        for i in range(0, len(texts), _SPARSE_BATCH_SIZE):
+            all_sparse.extend(encode(texts[i: i + _SPARSE_BATCH_SIZE]))
+
+        out_q.put((batch_id, all_sparse))
+        print(f"[P3] Sparse batch {batch_id} done ({len(texts)} chunks)")
+
+    torch.cuda.empty_cache()
+    print("[P3] Done.")
+
+
+# ======================================================================
+# Process 4: Qdrant writer
+# ======================================================================
+
+_REQUIRED_KEYS = frozenset({"meta", "dense", "sparse"})
+
+
+def qdrant_writer(
+    from_loader_q: mp.Queue,
+    from_dense_q: mp.Queue,
+    from_sparse_q: mp.Queue,
+) -> None:
+    """
+    P1 からメタデータ、P2 から dense、P3 から sparse を受け取り、
+    同じ batch_id のデータが揃ったら Qdrant へ upsert する。
+    """
+    print("[P4] Starting Qdrant writer...")
+
+    qdrant = QdrantClient(path=_QDRANT_DB_PATH)
+    _ensure_collection(qdrant)
+
+    pending: dict[int, dict[str, Any]] = {}
+    finished_sources = 0
+    lock = threading.Lock()
+    upsert_event = threading.Event()
+    done_event = threading.Event()
+
+    # -- 汎用レシーバー ------------------------------------------------
+
+    def _receiver(queue: mp.Queue, key: str) -> None:
+        """Queue から受信し pending[batch_id][key] に格納する。"""
+        nonlocal finished_sources
+        while True:
+            item = queue.get()
+            if isinstance(item, _Sentinel):
+                with lock:
+                    finished_sources += 1
+                    if finished_sources >= 3:
+                        done_event.set()
+                upsert_event.set()
+                return
+            batch_id, data = item
+            with lock:
+                pending.setdefault(batch_id, {})[key] = data
+            upsert_event.set()
+
+    # -- upsert --------------------------------------------------------
+
+    def _do_upsert(bid: int) -> None:
+        entry = pending.get(bid)
+        if entry is None or not _REQUIRED_KEYS <= entry.keys():
+            return
+
+        chunk_dicts = entry["meta"]
+        dense_vecs = entry["dense"]
+        sparse_dicts = entry["sparse"]
+
+        for i in range(0, len(chunk_dicts), _UPSERT_BATCH_SIZE):
+            items = chunk_dicts[i: i + _UPSERT_BATCH_SIZE]
+            d_vecs = dense_vecs[i: i + _UPSERT_BATCH_SIZE]
+            s_vecs = sparse_dicts[i: i + _UPSERT_BATCH_SIZE]
+
+            points = [
+                models.PointStruct(
+                    id=meta["point_id"],
+                    vector={
+                        "": dense.tolist(),
+                        "splade": models.SparseVector(
+                            indices=sparse["indices"], values=sparse["values"],
+                        ),
+                    },
+                    payload={
+                        "article_id": meta["article_id"],
+                        "title": meta["title"],
+                        "chunk_text": meta["chunk_text"],
+                        "chunk_index": meta["chunk_index"],
+                    },
+                )
+                for meta, dense, sparse in zip(items, d_vecs, s_vecs)
+            ]
+            qdrant.upsert(_COLLECTION_NAME, points=points)
+
+        print(f"[P4] Upserted batch {bid} ({len(chunk_dicts)} points)")
+        del pending[bid]
+
+    # -- 3 つの Queue を並行受信するスレッドを起動 ---------------------
+
+    threads = [
+        threading.Thread(target=_receiver, args=(from_loader_q, "meta"), daemon=True),
+        threading.Thread(target=_receiver, args=(from_dense_q, "dense"), daemon=True),
+        threading.Thread(target=_receiver, args=(from_sparse_q, "sparse"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    # -- メインスレッドで upsert を処理 --------------------------------
+
+    while True:
+        upsert_event.wait(timeout=1.0)
+        upsert_event.clear()
+
+        with lock:
+            ready = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
+        for bid in sorted(ready):
+            _do_upsert(bid)
+
+        if done_event.is_set():
+            with lock:
+                remaining = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
+            for bid in sorted(remaining):
+                _do_upsert(bid)
+            break
+
+    for t in threads:
+        t.join()
+    qdrant.close()
+    print("[P4] Done.")
+
+
+# ======================================================================
+# パイプラインオーケストレーション
+# ======================================================================
+
+def run_parallel_registration() -> None:
+    """
+    4 プロセスをパイプラインで並列実行し、Qdrant に登録する。
+
+    P1 --batch--> P2 (cuda:0, dense) --result--> P4 (Qdrant upsert)
+    P1 --batch--> P3 (cuda:1, sparse) --result--> P4
+    P1 --meta---> P4
+    """
+    mp.set_start_method("spawn", force=True)
+
+    loader_to_dense: mp.Queue = mp.Queue(maxsize=8)
+    loader_to_sparse: mp.Queue = mp.Queue(maxsize=8)
+    loader_to_writer: mp.Queue = mp.Queue(maxsize=8)
+    dense_to_writer: mp.Queue = mp.Queue(maxsize=8)
+    sparse_to_writer: mp.Queue = mp.Queue(maxsize=8)
+
+    processes = [
+        mp.Process(target=dataset_loader,
+                   args=(loader_to_dense, loader_to_sparse, loader_to_writer),
+                   name="P1-Loader"),
+        mp.Process(target=dense_encoder,
+                   args=(loader_to_dense, dense_to_writer),
+                   name="P2-Dense"),
+        mp.Process(target=sparse_encoder,
+                   args=(loader_to_sparse, sparse_to_writer),
+                   name="P3-Sparse"),
+        mp.Process(target=qdrant_writer,
+                   args=(loader_to_writer, dense_to_writer, sparse_to_writer),
+                   name="P4-Qdrant"),
+    ]
+
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
+
+    print("All processes finished.")
+
+
+# ======================================================================
+# 検索 (単一プロセス・既存互換)
+# ======================================================================
 
 class MedicalTermSearcher:
+    """検索用クラス。登録は run_parallel_registration() で行う。"""
+
     def __init__(self):
-        self.qdrant_db = QdrantClient(path=Path(__file__).parent.joinpath("qdrant_db").as_posix())
-        if not self.qdrant_db.collection_exists("medical_terms"):
-            self.qdrant_db.create_collection(
-                "medical_terms",
-                vectors_config=models.VectorParams(
-                    size=768,
-                    distance=models.Distance.COSINE
-                ),
-                sparse_vectors_config={"splade": models.SparseVectorParams(
-                    index=models.SparseIndexParams(
-                        full_scan_threshold=1000,
-                    )
-                )}
-            )
-        self.wiki_dataset = load_dataset("omarkamali/wikipedia-monthly", "latest.en", split="train", streaming=False)
+        self.qdrant_db = QdrantClient(path=_QDRANT_DB_PATH)
+        _ensure_collection(self.qdrant_db)
 
         # noinspection PyNoneFunctionAssignment
-        self.ruri_tokenizer = AutoTokenizer.from_pretrained("cl-nagoya/ruri-v3-310m")
-
+        self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
         self.embedding = AutoModel.from_pretrained(
-            "cl-nagoya/ruri-v3-310m",
+            _DENSE_MODEL,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
         )
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
-            "hotchpotch/japanese-splade-v2",
+            _SPARSE_MODEL,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
         )
         # noinspection PyTypeChecker
-        self._yasem = yasem.SpladeEmbedder(
-            "hotchpotch/japanese-splade-v2",
-            device="cuda:0"
-        )
+        self._yasem = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:0")
         self._yasem.model = self.splade
 
-        # noinspection PyNoneFunctionAssignment
-        self.splade_tokenizer = AutoTokenizer.from_pretrained("hotchpotch/japanese-splade-v2")
-        # noinspection PyTypeChecker
-        self.chunker = semchunk.chunkerify(self.splade_tokenizer, chunk_size=_CHUNK_SIZE)
-
     def close(self) -> None:
-        """リソースを明示的に解放する。"""
         self.qdrant_db.close()
 
-    # ------------------------------------------------------------------
-    # エンコード
-    # ------------------------------------------------------------------
-
     def _encode_dense(self, texts: list[str]) -> np.ndarray:
-        """
-        ruri-v3-310m でテキストをdenseエンべディングする。
-        戻り値: shape (N, 768) の numpy 配列（L2正規化済み）
-        """
         encoded = self.ruri_tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=8192,
-            return_tensors="pt",
+            texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
         )
         if hasattr(self.embedding, "device"):
             encoded = {k: v.to(self.embedding.device) for k, v in encoded.items()}
@@ -104,67 +472,27 @@ class MedicalTermSearcher:
         emb = F.normalize(emb, p=2, dim=1)
         return emb.cpu().float().numpy()
 
-    def _encode_dense_batched(self, texts: list[str]) -> np.ndarray:
-        """
-        大量テキストをバッチ分割して Dense エンコードする。
-        戻り値: shape (N, 768) の numpy 配列
-        """
-        all_embs: list[np.ndarray] = []
-        for i in tqdm.trange(0, len(texts), _DENSE_BATCH_SIZE, desc="Dense encode"):
-            batch = texts[i : i + _DENSE_BATCH_SIZE]
-            all_embs.append(self._encode_dense(batch))
-        return np.concatenate(all_embs, axis=0)
-
     def _encode_sparse(self, texts: list[str]) -> list[models.SparseVector]:
-        """
-        japanese-splade-v2 でテキストをsparseエンべディングする。
-        戻り値: Qdrant SparseVector のリスト
-        """
         sparse_matrix = self._yasem.encode(texts, convert_to_csr_matrix=True)
-        result = []
-        for i in range(sparse_matrix.shape[0]):
-            row = sparse_matrix.getrow(i)
-            result.append(models.SparseVector(
-                indices=row.indices.tolist(),
-                values=row.data.tolist(),
-            ))
-        return result
-
-    def _encode_sparse_batched(self, texts: list[str]) -> list[models.SparseVector]:
-        """
-        大量テキストをバッチ分割して Sparse エンコードする。
-        """
-        all_sparse: list[models.SparseVector] = []
-        for i in tqdm.trange(0, len(texts), _SPARSE_BATCH_SIZE, desc="Sparse encode"):
-            batch = texts[i : i + _SPARSE_BATCH_SIZE]
-            all_sparse.extend(self._encode_sparse(batch))
-        return all_sparse
-
-    # ------------------------------------------------------------------
-    # 検索
-    # ------------------------------------------------------------------
+        return [
+            models.SparseVector(
+                indices=sparse_matrix.getrow(i).indices.tolist(),
+                values=sparse_matrix.getrow(i).data.tolist(),
+            )
+            for i in range(sparse_matrix.shape[0])
+        ]
 
     def search_medical_term(self, _term: str) -> str:
-        """
-        英語の医療用語を指定すると、該当のWikipediaの記事と、それに対応する日本語Wikipediaの記事を返します。
-        """
-        query_prefixed = f"検索クエリ: {_term}"
-
-        dense_vec = self._encode_dense([query_prefixed])[0].tolist()
+        dense_vec = self._encode_dense([f"検索クエリ: {_term}"])[0].tolist()
         sparse_vec = self._encode_sparse([_term])[0]
 
         results = self.qdrant_db.query_points_groups(
-            collection_name="medical_terms",
+            collection_name=_COLLECTION_NAME,
             prefetch=[
-                models.Prefetch(
-                    query=dense_vec,
-                    using="",
-                    limit=20,
-                ),
+                models.Prefetch(query=dense_vec, using="", limit=20),
                 models.Prefetch(
                     query=models.SparseVector(
-                        indices=sparse_vec.indices,
-                        values=sparse_vec.values,
+                        indices=sparse_vec.indices, values=sparse_vec.values,
                     ),
                     using="splade",
                     limit=20,
@@ -201,117 +529,16 @@ class MedicalTermSearcher:
 
         return json.dumps({"results": hits}, ensure_ascii=False, indent=2)
 
-    # ------------------------------------------------------------------
-    # 登録
-    # ------------------------------------------------------------------
 
-    def register_medical_terms(self) -> None:
-        """
-        医療用語をWikipediaから抽出し、Qdrantに登録する。
+# ======================================================================
+# エントリーポイント
+# ======================================================================
 
-        Phase 1: 全記事をチャンク分割し、未登録チャンクの一覧を作成
-        Phase 2: 全チャンクの Dense ベクトルを一括生成
-        Phase 3: 全チャンクの Sparse ベクトルを一括生成
-        Phase 4: Qdrant に一括 upsert
-        """
-        # ==============================================================
-        # Phase 1: 前処理 — チャンク分割・未登録チェック
-        # ==============================================================
-        print("Phase 1: Chunking and filtering already-registered entries...")
-        all_chunks: list[dict] = []
+if __name__ == "__main__":
+    run_parallel_registration()
 
-        _len = self.wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
-        _item: dict
-        for _item in tqdm.tqdm(self.wiki_dataset, total=_len, desc="Chunking"):  # type: ignore[assignment]
-            _data_id: str = _item["id"]
-            _title: str = _item["title"]
-            _text: str = _item["text"]
-
-            _chunks: list[str] = self.chunker(_text)
-            _point_ids = [
-                str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{_chunk_idx}"))
-                for _chunk_idx in range(len(_chunks))
-            ]
-
-            _existing = self.qdrant_db.retrieve(
-                "medical_terms",
-                ids=_point_ids,
-                with_payload=False,
-                with_vectors=False,
-            )
-            _existing_ids = {p.id for p in _existing}
-
-            for _chunk_idx, (_chunk, _point_id) in enumerate(zip(_chunks, _point_ids)):
-                if _point_id in _existing_ids:
-                    continue
-                all_chunks.append({
-                    "point_id": _point_id,
-                    "article_id": _data_id,
-                    "title": _title,
-                    "chunk_text": _chunk,
-                    "chunk_index": _chunk_idx,
-                })
-
-        if not all_chunks:
-            print("All chunks are already registered. Nothing to do.")
-            return
-
-        print(f"  {len(all_chunks)} new chunks to register.")
-
-        # テキスト一覧を事前に作成（メモリに載せておく）
-        chunk_texts = [item["chunk_text"] for item in all_chunks]
-        prefixed_texts = [f"検索文書: {t}" for t in chunk_texts]
-
-        # ==============================================================
-        # Phase 2: Dense ベクトル一括生成
-        # ==============================================================
-        print("Phase 2: Dense encoding...")
-        dense_vecs = self._encode_dense_batched(prefixed_texts)
-
-        # Dense 完了後に GPU メモリを解放し Sparse 用に確保しやすくする
-        torch.cuda.empty_cache()
-
-        # ==============================================================
-        # Phase 3: Sparse ベクトル一括生成
-        # ==============================================================
-        print("Phase 3: Sparse encoding...")
-        sparse_vecs = self._encode_sparse_batched(chunk_texts)
-
-        torch.cuda.empty_cache()
-
-        # ==============================================================
-        # Phase 4: Qdrant upsert
-        # ==============================================================
-        print("Phase 4: Upserting to Qdrant...")
-        for i in tqdm.trange(0, len(all_chunks), _UPSERT_BATCH_SIZE, desc="Upsert"):
-            batch_items = all_chunks[i : i + _UPSERT_BATCH_SIZE]
-            batch_dense = dense_vecs[i : i + _UPSERT_BATCH_SIZE]
-            batch_sparse = sparse_vecs[i : i + _UPSERT_BATCH_SIZE]
-
-            points = []
-            for item, dense, sparse in zip(batch_items, batch_dense, batch_sparse):
-                points.append(models.PointStruct(
-                    id=item["point_id"],
-                    vector={
-                        "": dense.tolist(),
-                        "splade": sparse,
-                    },
-                    payload={
-                        "article_id": item["article_id"],
-                        "title": item["title"],
-                        "chunk_text": item["chunk_text"],
-                        "chunk_index": item["chunk_index"],
-                    },
-                ))
-            self.qdrant_db.upsert("medical_terms", points=points)
-
-        print("Done.")
-
-
-if __name__ == '__main__':
     searcher = MedicalTermSearcher()
     try:
-        searcher.register_medical_terms()
         print(searcher.search_medical_term("juxtaglomerular apparatus"))
     finally:
         searcher.close()
