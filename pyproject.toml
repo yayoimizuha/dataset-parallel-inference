@@ -22,7 +22,7 @@ dependencies = [
     "accelerate",
     "more-itertools",
     "semchunk",
-    "mecab",
+    "fugashi",
 ]
 
 [build-system]
