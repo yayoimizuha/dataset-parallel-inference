@@ -1,7 +1,5 @@
-import asyncio
 import json
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -15,13 +13,13 @@ from datasets import load_dataset
 from qdrant_client import QdrantClient, models
 from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer, BitsAndBytesConfig
 
-_BATCH_SIZE = 4096
 _CHUNK_SIZE = 512
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-# パイプラインキューの最大サイズ（バッチ数）
-# メモリ使用量を制限しつつ、ステージ間の待ちを減らす
-_QUEUE_MAXSIZE = 3
+# 各フェーズのバッチサイズ（メモリに余裕があるので大きく取る）
+_DENSE_BATCH_SIZE = 4096
+_SPARSE_BATCH_SIZE = 4096
+_UPSERT_BATCH_SIZE = 10000
 
 
 def _mean_pooling(model_output, attention_mask) -> torch.Tensor:
@@ -64,12 +62,12 @@ class MedicalTermSearcher:
             "hotchpotch/japanese-splade-v2",
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
-            device_map="cuda:1",
+            device_map="cuda:0",
         )
         # noinspection PyTypeChecker
         self._yasem = yasem.SpladeEmbedder(
             "hotchpotch/japanese-splade-v2",
-            device="cuda:1"
+            device="cuda:0"
         )
         self._yasem.model = self.splade
 
@@ -78,18 +76,12 @@ class MedicalTermSearcher:
         # noinspection PyTypeChecker
         self.chunker = semchunk.chunkerify(self.splade_tokenizer, chunk_size=_CHUNK_SIZE)
 
-        # GPU 推論は同一スレッドで逐次実行（torch.no_grad のスレッド安全性のため）
-        self._gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
-        self._io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io")
-
     def close(self) -> None:
         """リソースを明示的に解放する。"""
-        self._gpu_executor.shutdown(wait=False)
-        self._io_executor.shutdown(wait=False)
         self.qdrant_db.close()
 
     # ------------------------------------------------------------------
-    # エンコード（同期メソッド — GPU スレッドから呼ばれる）
+    # エンコード
     # ------------------------------------------------------------------
 
     def _encode_dense(self, texts: list[str]) -> np.ndarray:
@@ -112,6 +104,17 @@ class MedicalTermSearcher:
         emb = F.normalize(emb, p=2, dim=1)
         return emb.cpu().float().numpy()
 
+    def _encode_dense_batched(self, texts: list[str]) -> np.ndarray:
+        """
+        大量テキストをバッチ分割して Dense エンコードする。
+        戻り値: shape (N, 768) の numpy 配列
+        """
+        all_embs: list[np.ndarray] = []
+        for i in tqdm.trange(0, len(texts), _DENSE_BATCH_SIZE, desc="Dense encode"):
+            batch = texts[i : i + _DENSE_BATCH_SIZE]
+            all_embs.append(self._encode_dense(batch))
+        return np.concatenate(all_embs, axis=0)
+
     def _encode_sparse(self, texts: list[str]) -> list[models.SparseVector]:
         """
         japanese-splade-v2 でテキストをsparseエンべディングする。
@@ -127,87 +130,28 @@ class MedicalTermSearcher:
             ))
         return result
 
-    def _encode_both(
-        self, dense_texts: list[str], sparse_texts: list[str]
-    ) -> tuple[np.ndarray, list[models.SparseVector]]:
+    def _encode_sparse_batched(self, texts: list[str]) -> list[models.SparseVector]:
         """
-        Dense + Sparse を同一スレッドで逐次実行する。
-        torch.no_grad() のグローバル状態が競合しないことを保証する。
+        大量テキストをバッチ分割して Sparse エンコードする。
         """
-        dense_vecs = self._encode_dense(dense_texts)
-        sparse_vecs = self._encode_sparse(sparse_texts)
-        return dense_vecs, sparse_vecs
-
-    # ------------------------------------------------------------------
-    # 非同期ラッパー
-    # ------------------------------------------------------------------
-
-    async def _encode_both_async(
-        self, dense_texts: list[str], sparse_texts: list[str]
-    ) -> tuple[np.ndarray, list[models.SparseVector]]:
-        """Dense + Sparse 推論を GPU スレッドで非同期実行する。"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._gpu_executor, self._encode_both, dense_texts, sparse_texts
-        )
-
-    # ------------------------------------------------------------------
-    # Qdrant upsert（非同期）
-    # ------------------------------------------------------------------
-
-    def _upsert_points(self, points: list[models.PointStruct]) -> None:
-        """Qdrant への upsert（同期 — IOスレッドから呼ばれる）。"""
-        self.qdrant_db.upsert("medical_terms", points=points)
-
-    async def _upsert_points_async(self, points: list[models.PointStruct]) -> None:
-        """upsert を IO スレッドプールで非同期実行する。"""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._io_executor, self._upsert_points, points)
-
-    # ------------------------------------------------------------------
-    # ポイント構築（CPU処理）
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_points(
-        batch: list[dict],
-        dense_vecs: np.ndarray,
-        sparse_vecs: list[models.SparseVector],
-    ) -> list[models.PointStruct]:
-        """バッチ、Dense/Sparseベクトルから Qdrant PointStruct のリストを構築する。"""
-        points = []
-        for item, dense, sparse in zip(batch, dense_vecs, sparse_vecs):
-            points.append(models.PointStruct(
-                id=item["point_id"],
-                vector={
-                    "": dense.tolist(),
-                    "splade": sparse,
-                },
-                payload={
-                    "article_id": item["article_id"],
-                    "title": item["title"],
-                    "chunk_text": item["chunk_text"],
-                    "chunk_index": item["chunk_index"],
-                },
-            ))
-        return points
+        all_sparse: list[models.SparseVector] = []
+        for i in tqdm.trange(0, len(texts), _SPARSE_BATCH_SIZE, desc="Sparse encode"):
+            batch = texts[i : i + _SPARSE_BATCH_SIZE]
+            all_sparse.extend(self._encode_sparse(batch))
+        return all_sparse
 
     # ------------------------------------------------------------------
     # 検索
     # ------------------------------------------------------------------
 
-    async def search_medical_term(self, _term: str) -> str:
+    def search_medical_term(self, _term: str) -> str:
         """
         英語の医療用語を指定すると、該当のWikipediaの記事と、それに対応する日本語Wikipediaの記事を返します。
         """
         query_prefixed = f"検索クエリ: {_term}"
 
-        dense_result, sparse_result = await self._encode_both_async(
-            [query_prefixed], [_term]
-        )
-
-        dense_vec = dense_result[0].tolist()
-        sparse_vec = sparse_result[0]
+        dense_vec = self._encode_dense([query_prefixed])[0].tolist()
+        sparse_vec = self._encode_sparse([_term])[0]
 
         results = self.qdrant_db.query_points_groups(
             collection_name="medical_terms",
@@ -258,119 +202,116 @@ class MedicalTermSearcher:
         return json.dumps({"results": hits}, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------
-    # 登録パイプライン
+    # 登録
     # ------------------------------------------------------------------
 
-    async def register_medical_terms(self) -> None:
+    def register_medical_terms(self) -> None:
         """
         医療用語をWikipediaから抽出し、Qdrantに登録する。
 
-        3段パイプライン:
-          Stage 1 (CPU)     : チャンク分割 → バッチ生成 → embed_queue へ
-          Stage 2 (GPU)     : Dense + Sparse 推論（同一スレッドで逐次） → upsert_queue へ
-          Stage 3 (IO)      : Qdrant upsert
-
-        Stage 2 が GPU で推論している間に Stage 1 は次のバッチの前処理を進め、
-        Stage 3 は前のバッチの upsert を IO スレッドで実行する。
+        Phase 1: 全記事をチャンク分割し、未登録チャンクの一覧を作成
+        Phase 2: 全チャンクの Dense ベクトルを一括生成
+        Phase 3: 全チャンクの Sparse ベクトルを一括生成
+        Phase 4: Qdrant に一括 upsert
         """
-        embed_queue: asyncio.Queue[list[dict] | None] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
-        upsert_queue: asyncio.Queue[list[models.PointStruct] | None] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+        # ==============================================================
+        # Phase 1: 前処理 — チャンク分割・未登録チェック
+        # ==============================================================
+        print("Phase 1: Chunking and filtering already-registered entries...")
+        all_chunks: list[dict] = []
 
-        # ----------------------------------------------------------
-        # Stage 1: 前処理 (CPU) — チャンク分割・バッチ生成
-        # ----------------------------------------------------------
-        async def _stage_preprocess() -> None:
-            _len = self.wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
-            _batch: list[dict] = []
+        _len = self.wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
+        _item: dict
+        for _item in tqdm.tqdm(self.wiki_dataset, total=_len, desc="Chunking"):  # type: ignore[assignment]
+            _data_id: str = _item["id"]
+            _title: str = _item["title"]
+            _text: str = _item["text"]
 
-            loop = asyncio.get_running_loop()
+            _chunks: list[str] = self.chunker(_text)
+            _point_ids = [
+                str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{_chunk_idx}"))
+                for _chunk_idx in range(len(_chunks))
+            ]
 
-            _item: dict
-            for _item in tqdm.tqdm(self.wiki_dataset, total=_len, desc="Registering"):  # type: ignore[assignment]
-                _data_id: str = _item["id"]
-                _title: str = _item["title"]
-                _text: str = _item["text"]
+            _existing = self.qdrant_db.retrieve(
+                "medical_terms",
+                ids=_point_ids,
+                with_payload=False,
+                with_vectors=False,
+            )
+            _existing_ids = {p.id for p in _existing}
 
-                _chunks: list[str] = self.chunker(_text)
-                _point_ids = [
-                    str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{_chunk_idx}"))
-                    for _chunk_idx in range(len(_chunks))
-                ]
+            for _chunk_idx, (_chunk, _point_id) in enumerate(zip(_chunks, _point_ids)):
+                if _point_id in _existing_ids:
+                    continue
+                all_chunks.append({
+                    "point_id": _point_id,
+                    "article_id": _data_id,
+                    "title": _title,
+                    "chunk_text": _chunk,
+                    "chunk_index": _chunk_idx,
+                })
 
-                # 既登録チェックを IO スレッドへオフロード
-                _existing = await loop.run_in_executor(
-                    self._io_executor,
-                    lambda ids=_point_ids: self.qdrant_db.retrieve(
-                        "medical_terms",
-                        ids=ids,
-                        with_payload=False,
-                        with_vectors=False,
-                    ),
-                )
-                _existing_ids = {p.id for p in _existing}
+        if not all_chunks:
+            print("All chunks are already registered. Nothing to do.")
+            return
 
-                for _chunk_idx, (_chunk, _point_id) in enumerate(zip(_chunks, _point_ids)):
-                    if _point_id in _existing_ids:
-                        continue
-                    _batch.append({
-                        "point_id": _point_id,
-                        "article_id": _data_id,
-                        "title": _title,
-                        "chunk_text": _chunk,
-                        "chunk_index": _chunk_idx,
-                    })
-                    if len(_batch) >= _BATCH_SIZE:
-                        await embed_queue.put(_batch)
-                        _batch = []
+        print(f"  {len(all_chunks)} new chunks to register.")
 
-            if _batch:
-                await embed_queue.put(_batch)
+        # テキスト一覧を事前に作成（メモリに載せておく）
+        chunk_texts = [item["chunk_text"] for item in all_chunks]
+        prefixed_texts = [f"検索文書: {t}" for t in chunk_texts]
 
-            # 終了シグナル
-            await embed_queue.put(None)
+        # ==============================================================
+        # Phase 2: Dense ベクトル一括生成
+        # ==============================================================
+        print("Phase 2: Dense encoding...")
+        dense_vecs = self._encode_dense_batched(prefixed_texts)
 
-        # ----------------------------------------------------------
-        # Stage 2: 推論 (GPU) — Dense + Sparse を同一スレッドで逐次実行
-        # ----------------------------------------------------------
-        async def _stage_embed() -> None:
-            while True:
-                batch = await embed_queue.get()
-                if batch is None:
-                    await upsert_queue.put(None)
-                    break
+        # Dense 完了後に GPU メモリを解放し Sparse 用に確保しやすくする
+        torch.cuda.empty_cache()
 
-                chunk_texts = [item["chunk_text"] for item in batch]
-                prefixed_texts = [f"検索文書: {t}" for t in chunk_texts]
+        # ==============================================================
+        # Phase 3: Sparse ベクトル一括生成
+        # ==============================================================
+        print("Phase 3: Sparse encoding...")
+        sparse_vecs = self._encode_sparse_batched(chunk_texts)
 
-                dense_vecs, sparse_vecs = await self._encode_both_async(
-                    prefixed_texts, chunk_texts
-                )
+        torch.cuda.empty_cache()
 
-                points = self._build_points(batch, dense_vecs, sparse_vecs)
-                await upsert_queue.put(points)
+        # ==============================================================
+        # Phase 4: Qdrant upsert
+        # ==============================================================
+        print("Phase 4: Upserting to Qdrant...")
+        for i in tqdm.trange(0, len(all_chunks), _UPSERT_BATCH_SIZE, desc="Upsert"):
+            batch_items = all_chunks[i : i + _UPSERT_BATCH_SIZE]
+            batch_dense = dense_vecs[i : i + _UPSERT_BATCH_SIZE]
+            batch_sparse = sparse_vecs[i : i + _UPSERT_BATCH_SIZE]
 
-        # ----------------------------------------------------------
-        # Stage 3: Qdrant upsert (IO)
-        # ----------------------------------------------------------
-        async def _stage_upsert() -> None:
-            while True:
-                points = await upsert_queue.get()
-                if points is None:
-                    break
-                await self._upsert_points_async(points)
+            points = []
+            for item, dense, sparse in zip(batch_items, batch_dense, batch_sparse):
+                points.append(models.PointStruct(
+                    id=item["point_id"],
+                    vector={
+                        "": dense.tolist(),
+                        "splade": sparse,
+                    },
+                    payload={
+                        "article_id": item["article_id"],
+                        "title": item["title"],
+                        "chunk_text": item["chunk_text"],
+                        "chunk_index": item["chunk_index"],
+                    },
+                ))
+            self.qdrant_db.upsert("medical_terms", points=points)
 
-        # パイプライン起動 — 全ステージを並行実行
-        await asyncio.gather(
-            _stage_preprocess(),
-            _stage_embed(),
-            _stage_upsert(),
-        )
+        print("Done.")
 
 
 if __name__ == '__main__':
     searcher = MedicalTermSearcher()
     try:
-        asyncio.run(searcher.register_medical_terms())
-        asyncio.run(searcher.search_medical_term("juxtaglomerular apparatus"))
+        searcher.register_medical_terms()
+        print(searcher.search_medical_term("juxtaglomerular apparatus"))
     finally:
         searcher.close()
