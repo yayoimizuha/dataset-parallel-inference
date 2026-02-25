@@ -32,14 +32,14 @@ build-backend = "setuptools.build_meta"
 [tool.uv]
 override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29", "xgrammar==0.1.31"]
 
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = false
-
 [tool.uv.sources]
 sglang = { git = "https://github.com/sgl-project/sglang.git", subdirectory = "python", branch = "main" }
 torch = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [tool.uv.extra-build-dependencies]
 flash_attn = ["torch", "einops", "ninja", "setuptools"]
