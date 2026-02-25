@@ -7,7 +7,9 @@ Process 3 (sparse_encoder): Sparse vector generation on cuda:1 -> sends to P4
 Process 4 (qdrant_writer):  Merges dense+sparse+meta results, upserts to Qdrant
 """
 import json
+import sys
 import threading
+import traceback
 import uuid
 from typing import Any
 
@@ -113,67 +115,79 @@ def dataset_loader(
     Wikipedia データセットを読み込み、チャンク分割・未登録チェックを行い、
     バッチ単位で P2 (dense), P3 (sparse), P4 (メタデータ) へ送信する。
     """
-    print("[P1] Starting dataset loader...")
+    try:
+        print("[P1] Starting dataset loader...", flush=True)
 
-    qdrant = QdrantClient(url=_QDRANT_URL)
-    _ensure_collection(qdrant)
+        qdrant = QdrantClient(url=_QDRANT_URL)
+        _ensure_collection(qdrant)
 
-    wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
-    splade_tokenizer = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
-    # noinspection PyTypeChecker
-    chunker = semchunk.chunkerify(splade_tokenizer, chunk_size=_CHUNK_SIZE)
+        wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
+        splade_tokenizer = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
+        # noinspection PyTypeChecker
+        chunker = semchunk.chunkerify(splade_tokenizer, chunk_size=_CHUNK_SIZE)
 
-    total = wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
-    batch_buf: list[dict[str, Any]] = []
-    batch_id = 0
-    sent_chunks = 0
+        total = wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
+        batch_buf: list[dict[str, Any]] = []
+        batch_id = 0
+        sent_chunks = 0
 
-    _item: dict
-    for _item in tqdm.tqdm(wiki_dataset, total=total, desc="[P1] Chunking"):  # type: ignore[assignment]
-        _data_id: str = _item["id"]
-        _title: str = _item["title"]
-        _text: str = _item["text"]
+        _item: dict
+        for _item in tqdm.tqdm(wiki_dataset, total=total, desc="[P1] Chunking"):  # type: ignore[assignment]
+            _data_id: str = _item["id"]
+            _title: str = _item["title"]
+            _text: str = _item["text"]
 
-        _chunks: list[str] = chunker(_text)
-        _point_ids = [
-            str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{ci}"))
-            for ci in range(len(_chunks))
-        ]
+            _chunks: list[str] = chunker(_text)
+            _point_ids = [
+                str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{ci}"))
+                for ci in range(len(_chunks))
+            ]
 
-        _existing = qdrant.retrieve(
-            _COLLECTION_NAME, ids=_point_ids, with_payload=False, with_vectors=False,
-        )
-        _existing_ids = {p.id for p in _existing}
+            _existing = qdrant.retrieve(
+                _COLLECTION_NAME, ids=_point_ids, with_payload=False, with_vectors=False,
+            )
+            _existing_ids = {p.id for p in _existing}
 
-        for ci, (_chunk, _pid) in enumerate(zip(_chunks, _point_ids)):
-            if _pid in _existing_ids:
-                continue
-            batch_buf.append({
-                "point_id": _pid,
-                "article_id": _data_id,
-                "title": _title,
-                "chunk_text": _chunk,
-                "chunk_index": ci,
-            })
-            if len(batch_buf) >= _LOADER_BATCH_SIZE:
-                _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
-                sent_chunks += len(batch_buf)
-                print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})")
-                batch_id += 1
-                batch_buf = []
+            for ci, (_chunk, _pid) in enumerate(zip(_chunks, _point_ids)):
+                if _pid in _existing_ids:
+                    continue
+                batch_buf.append({
+                    "point_id": _pid,
+                    "article_id": _data_id,
+                    "title": _title,
+                    "chunk_text": _chunk,
+                    "chunk_index": ci,
+                })
+                if len(batch_buf) >= _LOADER_BATCH_SIZE:
+                    _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
+                    sent_chunks += len(batch_buf)
+                    print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
+                    batch_id += 1
+                    batch_buf = []
 
-    # 残りを送信
-    if batch_buf:
-        _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
-        sent_chunks += len(batch_buf)
-        print(f"[P1] Sent final batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})")
+        # 残りを送信
+        if batch_buf:
+            _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
+            sent_chunks += len(batch_buf)
+            print(f"[P1] Sent final batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
 
-    # 終了シグナル
-    for q in (to_dense_q, to_sparse_q, to_writer_q):
-        q.put(SENTINEL)
+        # 終了シグナル
+        for q in (to_dense_q, to_sparse_q, to_writer_q):
+            q.put(SENTINEL)
 
-    qdrant.close()
-    print(f"[P1] Done. Total {sent_chunks} chunks sent.")
+        qdrant.close()
+        print(f"[P1] Done. Total {sent_chunks} chunks sent.", flush=True)
+
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        # 終了シグナルを送って他プロセスがハングしないようにする
+        for q in (to_dense_q, to_sparse_q, to_writer_q):
+            try:
+                q.put(SENTINEL)
+            except Exception:
+                pass
+        raise
 
 
 # ======================================================================
@@ -182,46 +196,58 @@ def dataset_loader(
 
 def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
     """ruri-v3-310m で dense ベクトルを生成し、結果を P4 へ送る。"""
-    print("[P2] Starting dense encoder on cuda:0...")
+    try:
+        print("[P2] Starting dense encoder on cuda:0...", flush=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
-    model = AutoModel.from_pretrained(
-        _DENSE_MODEL,
-        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-        trust_remote_code=True,
-        device_map="cuda:0",
-    )
-
-    def encode(texts: list[str]) -> np.ndarray:
-        encoded = tokenizer(
-            texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
+        tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
+        model = AutoModel.from_pretrained(
+            _DENSE_MODEL,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            trust_remote_code=True,
+            device_map="cuda:0",
         )
-        if hasattr(model, "device"):
-            encoded = {k: v.to(model.device) for k, v in encoded.items()}
-        with torch.no_grad():
-            output = model(**encoded)
-        emb = _mean_pooling(output, encoded["attention_mask"])
-        emb = F.normalize(emb, p=2, dim=1)
-        return emb.cpu().float().numpy()
+        print("[P2] Model loaded.", flush=True)
 
-    while True:
-        item = in_q.get()
-        if isinstance(item, _Sentinel):
+        def encode(texts: list[str]) -> np.ndarray:
+            encoded = tokenizer(
+                texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
+            )
+            if hasattr(model, "device"):
+                encoded = {k: v.to(model.device) for k, v in encoded.items()}
+            with torch.no_grad():
+                output = model(**encoded)
+            emb = _mean_pooling(output, encoded["attention_mask"])
+            emb = F.normalize(emb, p=2, dim=1)
+            return emb.cpu().float().numpy()
+
+        while True:
+            item = in_q.get()
+            if isinstance(item, _Sentinel):
+                out_q.put(SENTINEL)
+                break
+
+            batch_id, chunk_dicts = item
+            texts = [f"検索文書: {d['chunk_text']}" for d in chunk_dicts]
+
+            all_embs = [
+                encode(texts[i: i + _DENSE_BATCH_SIZE])
+                for i in range(0, len(texts), _DENSE_BATCH_SIZE)
+            ]
+            out_q.put((batch_id, np.concatenate(all_embs, axis=0)))
+            print(f"[P2] Dense batch {batch_id} done ({len(texts)} chunks)", flush=True)
+
+        torch.cuda.empty_cache()
+        print("[P2] Done.", flush=True)
+
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        # P4 がハングしないように終了シグナルを送る
+        try:
             out_q.put(SENTINEL)
-            break
-
-        batch_id, chunk_dicts = item
-        texts = [f"検索文書: {d['chunk_text']}" for d in chunk_dicts]
-
-        all_embs = [
-            encode(texts[i: i + _DENSE_BATCH_SIZE])
-            for i in range(0, len(texts), _DENSE_BATCH_SIZE)
-        ]
-        out_q.put((batch_id, np.concatenate(all_embs, axis=0)))
-        print(f"[P2] Dense batch {batch_id} done ({len(texts)} chunks)")
-
-    torch.cuda.empty_cache()
-    print("[P2] Done.")
+        except Exception:
+            pass
+        raise
 
 
 # ======================================================================
@@ -230,44 +256,55 @@ def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
 
 def sparse_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
     """japanese-splade-v2 で sparse ベクトルを生成し、結果を P4 へ送る。"""
-    print("[P3] Starting sparse encoder on cuda:1...")
+    try:
+        print("[P3] Starting sparse encoder on cuda:1...", flush=True)
 
-    splade_model = AutoModelForMaskedLM.from_pretrained(
-        _SPARSE_MODEL,
-        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-        trust_remote_code=True,
-        device_map="cuda:1",
-    )
-    # noinspection PyTypeChecker
-    splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
-    splade_embedder.model = splade_model
+        splade_model = AutoModelForMaskedLM.from_pretrained(
+            _SPARSE_MODEL,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            trust_remote_code=True,
+            device_map="cuda:1",
+        )
+        # noinspection PyTypeChecker
+        splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
+        splade_embedder.model = splade_model
+        print("[P3] Model loaded.", flush=True)
 
-    def encode(texts: list[str]) -> list[dict]:
-        sparse_matrix = splade_embedder.encode(texts, convert_to_csr_matrix=True)
-        return [
-            {"indices": sparse_matrix.getrow(i).indices.tolist(),
-             "values": sparse_matrix.getrow(i).data.tolist()}
-            for i in range(sparse_matrix.shape[0])
-        ]
+        def encode(texts: list[str]) -> list[dict]:
+            sparse_matrix = splade_embedder.encode(texts, convert_to_csr_matrix=True)
+            return [
+                {"indices": sparse_matrix.getrow(i).indices.tolist(),
+                 "values": sparse_matrix.getrow(i).data.tolist()}
+                for i in range(sparse_matrix.shape[0])
+            ]
 
-    while True:
-        item = in_q.get()
-        if isinstance(item, _Sentinel):
+        while True:
+            item = in_q.get()
+            if isinstance(item, _Sentinel):
+                out_q.put(SENTINEL)
+                break
+
+            batch_id, chunk_dicts = item
+            texts = [d["chunk_text"] for d in chunk_dicts]
+
+            all_sparse: list[dict] = []
+            for i in range(0, len(texts), _SPARSE_BATCH_SIZE):
+                all_sparse.extend(encode(texts[i: i + _SPARSE_BATCH_SIZE]))
+
+            out_q.put((batch_id, all_sparse))
+            print(f"[P3] Sparse batch {batch_id} done ({len(texts)} chunks)", flush=True)
+
+        torch.cuda.empty_cache()
+        print("[P3] Done.", flush=True)
+
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        try:
             out_q.put(SENTINEL)
-            break
-
-        batch_id, chunk_dicts = item
-        texts = [d["chunk_text"] for d in chunk_dicts]
-
-        all_sparse: list[dict] = []
-        for i in range(0, len(texts), _SPARSE_BATCH_SIZE):
-            all_sparse.extend(encode(texts[i: i + _SPARSE_BATCH_SIZE]))
-
-        out_q.put((batch_id, all_sparse))
-        print(f"[P3] Sparse batch {batch_id} done ({len(texts)} chunks)")
-
-    torch.cuda.empty_cache()
-    print("[P3] Done.")
+        except Exception:
+            pass
+        raise
 
 
 # ======================================================================
@@ -286,107 +323,113 @@ def qdrant_writer(
     P1 からメタデータ、P2 から dense、P3 から sparse を受け取り、
     同じ batch_id のデータが揃ったら Qdrant へ upsert する。
     """
-    print("[P4] Starting Qdrant writer...")
+    try:
+        print("[P4] Starting Qdrant writer...", flush=True)
 
-    qdrant = QdrantClient(url=_QDRANT_URL)
-    _ensure_collection(qdrant)
+        qdrant = QdrantClient(url=_QDRANT_URL)
+        _ensure_collection(qdrant)
 
-    pending: dict[int, dict[str, Any]] = {}
-    finished_sources = 0
-    lock = threading.Lock()
-    upsert_event = threading.Event()
-    done_event = threading.Event()
+        pending: dict[int, dict[str, Any]] = {}
+        finished_sources = 0
+        lock = threading.Lock()
+        upsert_event = threading.Event()
+        done_event = threading.Event()
 
-    # -- 汎用レシーバー ------------------------------------------------
+        # -- 汎用レシーバー --------------------------------------------
 
-    def _receiver(queue: mp.Queue, key: str) -> None:
-        """Queue から受信し pending[batch_id][key] に格納する。"""
-        nonlocal finished_sources
-        while True:
-            item = queue.get()
-            if isinstance(item, _Sentinel):
+        def _receiver(queue: mp.Queue, key: str) -> None:
+            """Queue から受信し pending[batch_id][key] に格納する。"""
+            nonlocal finished_sources
+            while True:
+                item = queue.get()
+                if isinstance(item, _Sentinel):
+                    with lock:
+                        finished_sources += 1
+                        if finished_sources >= 3:
+                            done_event.set()
+                    upsert_event.set()
+                    return
+                batch_id, data = item
                 with lock:
-                    finished_sources += 1
-                    if finished_sources >= 3:
-                        done_event.set()
+                    pending.setdefault(batch_id, {})[key] = data
                 upsert_event.set()
+
+        # -- upsert ----------------------------------------------------
+
+        def _do_upsert(bid: int) -> None:
+            entry = pending.get(bid)
+            if entry is None or not _REQUIRED_KEYS <= entry.keys():
                 return
-            batch_id, data = item
+
+            chunk_dicts = entry["meta"]
+            dense_vecs = entry["dense"]
+            sparse_dicts = entry["sparse"]
+
+            for i in range(0, len(chunk_dicts), _UPSERT_BATCH_SIZE):
+                items = chunk_dicts[i: i + _UPSERT_BATCH_SIZE]
+                d_vecs = dense_vecs[i: i + _UPSERT_BATCH_SIZE]
+                s_vecs = sparse_dicts[i: i + _UPSERT_BATCH_SIZE]
+
+                points = [
+                    models.PointStruct(
+                        id=meta["point_id"],
+                        vector={
+                            "": dense.tolist(),
+                            "splade": models.SparseVector(
+                                indices=sparse["indices"], values=sparse["values"],
+                            ),
+                        },
+                        payload={
+                            "article_id": meta["article_id"],
+                            "title": meta["title"],
+                            "chunk_text": meta["chunk_text"],
+                            "chunk_index": meta["chunk_index"],
+                        },
+                    )
+                    for meta, dense, sparse in zip(items, d_vecs, s_vecs)
+                ]
+                qdrant.upsert(_COLLECTION_NAME, points=points)
+
+            print(f"[P4] Upserted batch {bid} ({len(chunk_dicts)} points)", flush=True)
+            del pending[bid]
+
+        # -- 3 つの Queue を並行受信するスレッドを起動 -----------------
+
+        threads = [
+            threading.Thread(target=_receiver, args=(from_loader_q, "meta"), daemon=True),
+            threading.Thread(target=_receiver, args=(from_dense_q, "dense"), daemon=True),
+            threading.Thread(target=_receiver, args=(from_sparse_q, "sparse"), daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        # -- メインスレッドで upsert を処理 ----------------------------
+
+        while True:
+            upsert_event.wait(timeout=1.0)
+            upsert_event.clear()
+
             with lock:
-                pending.setdefault(batch_id, {})[key] = data
-            upsert_event.set()
-
-    # -- upsert --------------------------------------------------------
-
-    def _do_upsert(bid: int) -> None:
-        entry = pending.get(bid)
-        if entry is None or not _REQUIRED_KEYS <= entry.keys():
-            return
-
-        chunk_dicts = entry["meta"]
-        dense_vecs = entry["dense"]
-        sparse_dicts = entry["sparse"]
-
-        for i in range(0, len(chunk_dicts), _UPSERT_BATCH_SIZE):
-            items = chunk_dicts[i: i + _UPSERT_BATCH_SIZE]
-            d_vecs = dense_vecs[i: i + _UPSERT_BATCH_SIZE]
-            s_vecs = sparse_dicts[i: i + _UPSERT_BATCH_SIZE]
-
-            points = [
-                models.PointStruct(
-                    id=meta["point_id"],
-                    vector={
-                        "": dense.tolist(),
-                        "splade": models.SparseVector(
-                            indices=sparse["indices"], values=sparse["values"],
-                        ),
-                    },
-                    payload={
-                        "article_id": meta["article_id"],
-                        "title": meta["title"],
-                        "chunk_text": meta["chunk_text"],
-                        "chunk_index": meta["chunk_index"],
-                    },
-                )
-                for meta, dense, sparse in zip(items, d_vecs, s_vecs)
-            ]
-            qdrant.upsert(_COLLECTION_NAME, points=points)
-
-        print(f"[P4] Upserted batch {bid} ({len(chunk_dicts)} points)")
-        del pending[bid]
-
-    # -- 3 つの Queue を並行受信するスレッドを起動 ---------------------
-
-    threads = [
-        threading.Thread(target=_receiver, args=(from_loader_q, "meta"), daemon=True),
-        threading.Thread(target=_receiver, args=(from_dense_q, "dense"), daemon=True),
-        threading.Thread(target=_receiver, args=(from_sparse_q, "sparse"), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-
-    # -- メインスレッドで upsert を処理 --------------------------------
-
-    while True:
-        upsert_event.wait(timeout=1.0)
-        upsert_event.clear()
-
-        with lock:
-            ready = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
-        for bid in sorted(ready):
-            _do_upsert(bid)
-
-        if done_event.is_set():
-            with lock:
-                remaining = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
-            for bid in sorted(remaining):
+                ready = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
+            for bid in sorted(ready):
                 _do_upsert(bid)
-            break
 
-    for t in threads:
-        t.join()
-    qdrant.close()
-    print("[P4] Done.")
+            if done_event.is_set():
+                with lock:
+                    remaining = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
+                for bid in sorted(remaining):
+                    _do_upsert(bid)
+                break
+
+        for t in threads:
+            t.join()
+        qdrant.close()
+        print("[P4] Done.", flush=True)
+
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
 
 
 # ======================================================================
@@ -428,6 +471,12 @@ def run_parallel_registration() -> None:
         p.start()
     for p in processes:
         p.join()
+
+    # 異常終了したプロセスを報告
+    failed = [p for p in processes if p.exitcode != 0]
+    if failed:
+        names = ", ".join(f"{p.name} (exit={p.exitcode})" for p in failed)
+        raise RuntimeError(f"Processes failed: {names}")
 
     print("All processes finished.")
 
