@@ -5,7 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    #    "aiohttp",
     "datasets",
     "openai",
     "python-dotenv",
@@ -22,7 +21,8 @@ dependencies = [
     "accelerate",
     "more-itertools",
     "semchunk",
-    "mecab"
+    "mecab",
+    "torch"
 ]
 
 [tool.uv.sources]
