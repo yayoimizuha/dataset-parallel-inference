@@ -9,7 +9,6 @@ Process 4 (qdrant_writer):  Merges dense+sparse+meta results, upserts to Qdrant
 import json
 import threading
 import uuid
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -36,7 +35,7 @@ _SPARSE_BATCH_SIZE = 4096
 _UPSERT_BATCH_SIZE = 10000
 _LOADER_BATCH_SIZE = 2048
 
-_QDRANT_DB_PATH = Path(__file__).parent.joinpath("qdrant_db").as_posix()
+_QDRANT_URL = "http://localhost:6333"
 _COLLECTION_NAME = "medical_terms"
 
 _DENSE_MODEL = "cl-nagoya/ruri-v3-310m"
@@ -110,7 +109,7 @@ def dataset_loader(
     """
     print("[P1] Starting dataset loader...")
 
-    qdrant = QdrantClient(path=_QDRANT_DB_PATH)
+    qdrant = QdrantClient(url=_QDRANT_URL)
     _ensure_collection(qdrant)
 
     wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
@@ -283,7 +282,7 @@ def qdrant_writer(
     """
     print("[P4] Starting Qdrant writer...")
 
-    qdrant = QdrantClient(path=_QDRANT_DB_PATH)
+    qdrant = QdrantClient(url=_QDRANT_URL)
     _ensure_collection(qdrant)
 
     pending: dict[int, dict[str, Any]] = {}
@@ -435,7 +434,7 @@ class MedicalTermSearcher:
     """検索用クラス。登録は run_parallel_registration() で行う。"""
 
     def __init__(self):
-        self.qdrant_db = QdrantClient(path=_QDRANT_DB_PATH)
+        self.qdrant_db = QdrantClient(url=_QDRANT_URL)
         _ensure_collection(self.qdrant_db)
 
         # noinspection PyNoneFunctionAssignment
