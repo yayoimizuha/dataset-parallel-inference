@@ -13,7 +13,16 @@ dependencies = [
     "sglang; sys_platform == 'linux'",
     "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
     "flash-attn; sys_platform == 'linux'",
-    "jsonpath-ng"
+    "bitsandbytes; sys_platform == 'linux'",
+    "jsonpath-ng",
+    "aiohttp",
+    "qdrant-client",
+    "yasem",
+    "hf_xet",
+    "accelerate",
+    "more-itertools",
+    "semchunk",
+    "mecab"
 ]
 
 [build-system]
