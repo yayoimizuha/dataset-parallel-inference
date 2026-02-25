@@ -78,21 +78,18 @@ class MedicalTermSearcher:
         # noinspection PyTypeChecker
         self.chunker = semchunk.chunkerify(self.splade_tokenizer, chunk_size=_CHUNK_SIZE)
 
-        # Dense / Sparse それぞれ専用のスレッドプールを用意
-        # GPU推論は GIL 解放中（CUDA カーネル実行中）に並列動作する
-        self._dense_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dense")
-        self._sparse_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sparse")
+        # GPU 推論は同一スレッドで逐次実行（torch.no_grad のスレッド安全性のため）
+        self._gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
         self._io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="io")
 
     def close(self) -> None:
         """リソースを明示的に解放する。"""
-        self._dense_executor.shutdown(wait=False)
-        self._sparse_executor.shutdown(wait=False)
+        self._gpu_executor.shutdown(wait=False)
         self._io_executor.shutdown(wait=False)
         self.qdrant_db.close()
 
     # ------------------------------------------------------------------
-    # エンコード（同期メソッド — スレッドプールから呼ばれる）
+    # エンコード（同期メソッド — GPU スレッドから呼ばれる）
     # ------------------------------------------------------------------
 
     def _encode_dense(self, texts: list[str]) -> np.ndarray:
@@ -130,19 +127,29 @@ class MedicalTermSearcher:
             ))
         return result
 
+    def _encode_both(
+        self, dense_texts: list[str], sparse_texts: list[str]
+    ) -> tuple[np.ndarray, list[models.SparseVector]]:
+        """
+        Dense + Sparse を同一スレッドで逐次実行する。
+        torch.no_grad() のグローバル状態が競合しないことを保証する。
+        """
+        dense_vecs = self._encode_dense(dense_texts)
+        sparse_vecs = self._encode_sparse(sparse_texts)
+        return dense_vecs, sparse_vecs
+
     # ------------------------------------------------------------------
     # 非同期ラッパー
     # ------------------------------------------------------------------
 
-    async def _encode_dense_async(self, texts: list[str]) -> np.ndarray:
-        """Dense推論を専用スレッドで非同期実行する。"""
+    async def _encode_both_async(
+        self, dense_texts: list[str], sparse_texts: list[str]
+    ) -> tuple[np.ndarray, list[models.SparseVector]]:
+        """Dense + Sparse 推論を GPU スレッドで非同期実行する。"""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._dense_executor, self._encode_dense, texts)
-
-    async def _encode_sparse_async(self, texts: list[str]) -> list[models.SparseVector]:
-        """Sparse推論を専用スレッドで非同期実行する。"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._sparse_executor, self._encode_sparse, texts)
+        return await loop.run_in_executor(
+            self._gpu_executor, self._encode_both, dense_texts, sparse_texts
+        )
 
     # ------------------------------------------------------------------
     # Qdrant upsert（非同期）
@@ -192,14 +199,12 @@ class MedicalTermSearcher:
     async def search_medical_term(self, _term: str) -> str:
         """
         英語の医療用語を指定すると、該当のWikipediaの記事と、それに対応する日本語Wikipediaの記事を返します。
-        Dense / Sparse 推論を並列実行し、検索レイテンシを削減する。
         """
         query_prefixed = f"検索クエリ: {_term}"
 
-        # Dense (cuda:0) と Sparse (cuda:1) を並列実行
-        dense_task = self._encode_dense_async([query_prefixed])
-        sparse_task = self._encode_sparse_async([_term])
-        dense_result, sparse_result = await asyncio.gather(dense_task, sparse_task)
+        dense_result, sparse_result = await self._encode_both_async(
+            [query_prefixed], [_term]
+        )
 
         dense_vec = dense_result[0].tolist()
         sparse_vec = sparse_result[0]
@@ -262,11 +267,11 @@ class MedicalTermSearcher:
 
         3段パイプライン:
           Stage 1 (CPU)     : チャンク分割 → バッチ生成 → embed_queue へ
-          Stage 2 (GPU×2)   : Dense + Sparse 推論を並列実行 → upsert_queue へ
+          Stage 2 (GPU)     : Dense + Sparse 推論（同一スレッドで逐次） → upsert_queue へ
           Stage 3 (IO)      : Qdrant upsert
 
-        各ステージは asyncio.Queue で接続され、前のステージの結果が
-        揃い次第、次のステージが処理を開始する。
+        Stage 2 が GPU で推論している間に Stage 1 は次のバッチの前処理を進め、
+        Stage 3 は前のバッチの upsert を IO スレッドで実行する。
         """
         embed_queue: asyncio.Queue[list[dict] | None] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         upsert_queue: asyncio.Queue[list[models.PointStruct] | None] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
@@ -325,7 +330,7 @@ class MedicalTermSearcher:
             await embed_queue.put(None)
 
         # ----------------------------------------------------------
-        # Stage 2: 推論 (GPU×2) — Dense + Sparse を並列実行
+        # Stage 2: 推論 (GPU) — Dense + Sparse を同一スレッドで逐次実行
         # ----------------------------------------------------------
         async def _stage_embed() -> None:
             while True:
@@ -337,10 +342,8 @@ class MedicalTermSearcher:
                 chunk_texts = [item["chunk_text"] for item in batch]
                 prefixed_texts = [f"検索文書: {t}" for t in chunk_texts]
 
-                # Dense (cuda:0) と Sparse (cuda:1) を同時に実行
-                dense_vecs, sparse_vecs = await asyncio.gather(
-                    self._encode_dense_async(prefixed_texts),
-                    self._encode_sparse_async(chunk_texts),
+                dense_vecs, sparse_vecs = await self._encode_both_async(
+                    prefixed_texts, chunk_texts
                 )
 
                 points = self._build_points(batch, dense_vecs, sparse_vecs)
