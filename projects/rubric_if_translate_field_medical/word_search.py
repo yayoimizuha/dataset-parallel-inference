@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from pathlib import Path
 import numpy as np
 import semchunk
@@ -14,6 +15,7 @@ from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer, BitsAnd
 
 _BATCH_SIZE = 512
 _CHUNK_SIZE = 512
+_UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 
 def _mean_pooling(model_output, attention_mask) -> torch.Tensor:
@@ -141,7 +143,7 @@ class MedicalTermSearcher:
         dense_vec = self._encode_dense([query_prefixed])[0].tolist()
         sparse_vec = self._encode_sparse([_term])[0]
 
-        results = self.qdrant_db.query_points(
+        results = self.qdrant_db.query_points_groups(
             collection_name="medical_terms",
             prefetch=[
                 models.Prefetch(
@@ -159,18 +161,30 @@ class MedicalTermSearcher:
                 ),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),  # type: ignore[arg-type]
+            group_by="article_id",
+            group_size=3,
             limit=5,
             with_payload=True,
         )
 
         hits = []
-        for point in results.points:
-            p = point.payload or {}
+        for group in results.groups:
+            chunks = []
+            title = None
+            for point in group.hits:
+                p = point.payload or {}
+                if title is None:
+                    title = p.get("title")
+                chunks.append({
+                    "chunk_text": p.get("chunk_text"),
+                    "chunk_index": p.get("chunk_index"),
+                    "score": point.score,
+                })
+            chunks.sort(key=lambda c: c.get("chunk_index", 0))
             hits.append({
-                "title": p.get("title"),
-                "chunk_text": p.get("chunk_text"),
-                "chunk_index": p.get("chunk_index"),
-                "score": point.score,
+                "article_id": group.id,
+                "title": title,
+                "chunks": chunks,
                 "ja_title": None,
                 "ja_url": None,
             })
@@ -193,7 +207,7 @@ class MedicalTermSearcher:
             # 記事の全チャンクIDを生成して既登録チェック
             _chunks: list[str] = self.chunker(_text)
             _point_ids = [
-                f"{_data_id}_{_chunk_idx}"
+                str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{_chunk_idx}"))
                 for _chunk_idx in range(len(_chunks))
             ]
             _existing = self.qdrant_db.retrieve(
