@@ -23,7 +23,7 @@ import tqdm
 import yasem
 from datasets import load_dataset
 from qdrant_client import QdrantClient, models
-from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer
 
 # ======================================================================
 # 定数
@@ -32,10 +32,10 @@ from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer, BitsAnd
 _CHUNK_SIZE = 512
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-_DENSE_BATCH_SIZE = 4096
-_SPARSE_BATCH_SIZE = 4096
+_DENSE_BATCH_SIZE = 8192
+_SPARSE_BATCH_SIZE = 8192
 _UPSERT_BATCH_SIZE = 500
-_LOADER_BATCH_SIZE = 2048
+_LOADER_BATCH_SIZE = 8192
 
 _QDRANT_URL = "http://localhost:6333"
 _COLLECTION_NAME = "medical_terms"
@@ -262,9 +262,9 @@ def sparse_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
 
         splade_model = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:1",
+            dtype=torch.bfloat16
         )
         # noinspection PyTypeChecker
         splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
@@ -497,7 +497,6 @@ class MedicalTermSearcher:
         self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
         self.embedding = AutoModel.from_pretrained(
             _DENSE_MODEL,
-            # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
             dtype=torch.bfloat16
@@ -505,9 +504,9 @@ class MedicalTermSearcher:
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
+            dtype=torch.bfloat16
         )
         # noinspection PyTypeChecker
         self._yasem = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:0")
