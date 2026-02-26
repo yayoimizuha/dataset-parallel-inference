@@ -496,7 +496,7 @@ class MedicalTermSearcher:
         self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
         self.embedding = AutoModel.from_pretrained(
             _DENSE_MODEL,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
         )
