@@ -32,8 +32,8 @@ from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer
 _CHUNK_SIZE = 512
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-_DENSE_BATCH_SIZE = 8192
-_SPARSE_BATCH_SIZE = 8192
+_DENSE_BATCH_SIZE = 2048
+_SPARSE_BATCH_SIZE = 2048
 _UPSERT_BATCH_SIZE = 500
 _LOADER_BATCH_SIZE = 8192
 
@@ -202,19 +202,16 @@ def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
         tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
         model = AutoModel.from_pretrained(
             _DENSE_MODEL,
-            # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map="cuda:0",
-            dtype=torch.bfloat16
-        )
+        ).to("cuda:0").eval()
         print("[P2] Model loaded.", flush=True)
 
         def encode(texts: list[str]) -> np.ndarray:
             encoded = tokenizer(
                 texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
             )
-            if hasattr(model, "device"):
-                encoded = {k: v.to(model.device) for k, v in encoded.items()}
+            encoded = {k: v.to("cuda:0") for k, v in encoded.items()}
             with torch.no_grad():
                 output = model(**encoded)
             emb = _mean_pooling(output, encoded["attention_mask"])
@@ -262,10 +259,9 @@ def sparse_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
 
         splade_model = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map="cuda:1",
-            dtype=torch.bfloat16
-        )
+        ).to("cuda:1").eval()
         # noinspection PyTypeChecker
         splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
         splade_embedder.model = splade_model
@@ -497,17 +493,15 @@ class MedicalTermSearcher:
         self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
         self.embedding = AutoModel.from_pretrained(
             _DENSE_MODEL,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map="cuda:0",
-            dtype=torch.bfloat16
-        )
+        ).to("cuda:0").eval()
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map="cuda:0",
-            dtype=torch.bfloat16
-        )
+        ).to("cuda:0").eval()
         # noinspection PyTypeChecker
         self._yasem = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:0")
         self._yasem.model = self.splade
@@ -519,8 +513,7 @@ class MedicalTermSearcher:
         encoded = self.ruri_tokenizer(
             texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
         )
-        if hasattr(self.embedding, "device"):
-            encoded = {k: v.to(self.embedding.device) for k, v in encoded.items()}
+        encoded = {k: v.to("cuda:0") for k, v in encoded.items()}
         with torch.no_grad():
             output = self.embedding(**encoded)
         emb = _mean_pooling(output, encoded["attention_mask"])
