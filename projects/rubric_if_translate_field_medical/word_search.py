@@ -7,6 +7,7 @@ Process 3 (sparse_encoder): Sparse vector generation on cuda:1 -> sends to P4
 Process 4 (qdrant_writer):  Merges dense+sparse+meta results, upserts to Qdrant
 """
 import json
+import os
 import sys
 import threading
 import traceback
@@ -21,7 +22,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 import tqdm
 import yasem
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from qdrant_client import QdrantClient, models
 from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer
 
@@ -36,6 +37,8 @@ _DENSE_BATCH_SIZE = 2048
 _SPARSE_BATCH_SIZE = 2048
 _UPSERT_BATCH_SIZE = 500
 _LOADER_BATCH_SIZE = 8192
+_RETRIEVE_BATCH_SIZE = 1000  # Qdrant 登録済みチェック用バッチサイズ
+_NUM_PROC = max(1, (os.cpu_count() or 1) - 4)  # チャンク分割の並列ワーカー数
 
 _QDRANT_URL = "http://localhost:6333"
 _COLLECTION_NAME = "medical_terms"
@@ -106,66 +109,122 @@ def _send_batch(batch_id: int, batch_buf: list[dict[str, Any]], *queues: mp.Queu
 # Process 1: Dataset loader
 # ======================================================================
 
+def _chunk_article(batch: dict[str, list]) -> dict[str, list]:
+    """
+    datasets.map() 用のバッチ処理関数。
+    記事をチャンク分割し、1チャンク1行に展開する (flat_map 相当)。
+    """
+    chunker = _get_chunker()
+
+    out_point_id: list[str] = []
+    out_article_id: list[str] = []
+    out_title: list[str] = []
+    out_chunk_text: list[str] = []
+    out_chunk_index: list[int] = []
+
+    for data_id, title, text in zip(batch["id"], batch["title"], batch["text"]):
+        chunks = chunker(text)
+        for ci, chunk in enumerate(chunks):
+            out_point_id.append(str(uuid.uuid5(_UUID_NAMESPACE, f"{data_id}_{ci}")))
+            out_article_id.append(data_id)
+            out_title.append(title)
+            out_chunk_text.append(chunk)
+            out_chunk_index.append(ci)
+
+    return {
+        "point_id": out_point_id,
+        "article_id": out_article_id,
+        "title": out_title,
+        "chunk_text": out_chunk_text,
+        "chunk_index": out_chunk_index,
+    }
+
+
+# ワーカーごとに chunker を1回だけ初期化 (プロセスセーフ)
+_chunker_cache = None
+
+
+def _get_chunker():
+    global _chunker_cache
+    if _chunker_cache is None:
+        _tok = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
+        # noinspection PyTypeChecker
+        _chunker_cache = semchunk.chunkerify(_tok, chunk_size=_CHUNK_SIZE)
+    return _chunker_cache
+
+
 def dataset_loader(
     to_dense_q: mp.Queue,
     to_sparse_q: mp.Queue,
     to_writer_q: mp.Queue,
 ) -> None:
     """
-    Wikipedia データセットを読み込み、チャンク分割・未登録チェックを行い、
+    Wikipedia データセットを読み込み、チャンク分割 (並列) ・未登録チェック (バッチ) を行い、
     バッチ単位で P2 (dense), P3 (sparse), P4 (メタデータ) へ送信する。
     """
     try:
-        print("[P1] Starting dataset loader...", flush=True)
+        print(f"[P1] Starting dataset loader (num_proc={_NUM_PROC})...", flush=True)
 
+        # ----------------------------------------------------------
+        # Phase 1a: データセット読み込み + チャンク分割 (並列)
+        # ----------------------------------------------------------
+        wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
+        print(f"[P1] Dataset loaded: {len(wiki_dataset)} articles", flush=True)
+
+        chunked: Dataset = wiki_dataset.map(
+            _chunk_article,
+            batched=True,
+            batch_size=1000,
+            num_proc=_NUM_PROC,
+            remove_columns=wiki_dataset.column_names,
+            desc="[P1] Chunking (parallel)",
+        )
+        print(f"[P1] Chunking done: {len(chunked)} chunks", flush=True)
+
+        # ----------------------------------------------------------
+        # Phase 1b: 登録済みチェック (バッチ)
+        # ----------------------------------------------------------
         qdrant = QdrantClient(url=_QDRANT_URL)
         _ensure_collection(qdrant)
 
-        wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
-        splade_tokenizer = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
-        # noinspection PyTypeChecker
-        chunker = semchunk.chunkerify(splade_tokenizer, chunk_size=_CHUNK_SIZE)
+        all_point_ids: list[str] = chunked["point_id"]
+        existing_ids: set[str] = set()
 
-        total = wiki_dataset.info.splits["train"].num_examples  # type: ignore[union-attr]
+        for i in tqdm.trange(0, len(all_point_ids), _RETRIEVE_BATCH_SIZE,
+                             desc="[P1] Checking existing"):
+            batch_ids = all_point_ids[i: i + _RETRIEVE_BATCH_SIZE]
+            found = qdrant.retrieve(
+                _COLLECTION_NAME, ids=batch_ids, with_payload=False, with_vectors=False,
+            )
+            existing_ids.update(p.id for p in found)
+
+        print(f"[P1] {len(existing_ids)} chunks already registered", flush=True)
+
+        # ----------------------------------------------------------
+        # Phase 1c: 未登録チャンクを Queue へ送信
+        # ----------------------------------------------------------
         batch_buf: list[dict[str, Any]] = []
         batch_id = 0
         sent_chunks = 0
 
-        _item: dict
-        for _item in tqdm.tqdm(wiki_dataset, total=total, desc="[P1] Chunking"):  # type: ignore[assignment]
-            _data_id: str = _item["id"]
-            _title: str = _item["title"]
-            _text: str = _item["text"]
+        for idx in tqdm.trange(len(chunked), desc="[P1] Sending"):
+            pid = chunked[idx]["point_id"]
+            if pid in existing_ids:
+                continue
+            batch_buf.append({
+                "point_id": pid,
+                "article_id": chunked[idx]["article_id"],
+                "title": chunked[idx]["title"],
+                "chunk_text": chunked[idx]["chunk_text"],
+                "chunk_index": chunked[idx]["chunk_index"],
+            })
+            if len(batch_buf) >= _LOADER_BATCH_SIZE:
+                _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
+                sent_chunks += len(batch_buf)
+                print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
+                batch_id += 1
+                batch_buf = []
 
-            _chunks: list[str] = chunker(_text)
-            _point_ids = [
-                str(uuid.uuid5(_UUID_NAMESPACE, f"{_data_id}_{ci}"))
-                for ci in range(len(_chunks))
-            ]
-
-            _existing = qdrant.retrieve(
-                _COLLECTION_NAME, ids=_point_ids, with_payload=False, with_vectors=False,
-            )
-            _existing_ids = {p.id for p in _existing}
-
-            for ci, (_chunk, _pid) in enumerate(zip(_chunks, _point_ids)):
-                if _pid in _existing_ids:
-                    continue
-                batch_buf.append({
-                    "point_id": _pid,
-                    "article_id": _data_id,
-                    "title": _title,
-                    "chunk_text": _chunk,
-                    "chunk_index": ci,
-                })
-                if len(batch_buf) >= _LOADER_BATCH_SIZE:
-                    _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
-                    sent_chunks += len(batch_buf)
-                    print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
-                    batch_id += 1
-                    batch_buf = []
-
-        # 残りを送信
         if batch_buf:
             _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
             sent_chunks += len(batch_buf)
@@ -181,7 +240,6 @@ def dataset_loader(
     except Exception:
         traceback.print_exc()
         sys.stdout.flush()
-        # 終了シグナルを送って他プロセスがハングしないようにする
         for q in (to_dense_q, to_sparse_q, to_writer_q):
             try:
                 q.put(SENTINEL)
@@ -200,6 +258,7 @@ def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
         print("[P2] Starting dense encoder on cuda:0...", flush=True)
 
         tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
+        tokenizer.model_max_length = 8192  # ruri-v3 は 8192 対応だが tokenizer 設定が 512 のまま
         model = AutoModel.from_pretrained(
             _DENSE_MODEL,
             torch_dtype=torch.bfloat16,
@@ -491,6 +550,7 @@ class MedicalTermSearcher:
 
         # noinspection PyNoneFunctionAssignment
         self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
+        self.ruri_tokenizer.model_max_length = 8192
         self.embedding = AutoModel.from_pretrained(
             _DENSE_MODEL,
             torch_dtype=torch.bfloat16,
