@@ -240,7 +240,7 @@ def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceS
 
         # GPU ごとにキャッシュディレクトリを分離 (エンジンは GPU 固有のため)
         # trt_cache_path = str(_TRT_CACHE_DIR / f"gpu{gpu_id}")
-        os.makedirs(trt_cache_path, exist_ok=True)
+        os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
 
         session = ort.InferenceSession(
             model_path,
