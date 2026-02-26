@@ -43,7 +43,7 @@ from transformers import AutoTokenizer
 _CHUNK_SIZE = 8192
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-_ENCODE_BATCH_SIZE = 64  # ONNX 推論 1 回あたりのバッチサイズ (8192 トークン長のため控えめに)
+_ENCODE_BATCH_SIZE = 16  # ONNX 推論 1 回あたりのバッチサイズ (8192 トークン長のため控えめに)
 _QUEUE_MAXSIZE = 32  # producer → consumer 間のバッファ上限
 _CONCURRENT_PER_GPU = 3  # 1 GPU あたりの同時推論バッチ数
 
