@@ -26,6 +26,7 @@ dependencies = [
     "unidic-lite",
     "onnxruntime-gpu",
     "polars",
+    "tensorrt"
 ]
 
 [build-system]
@@ -50,3 +51,4 @@ flash_attn = ["torch", "einops", "ninja", "setuptools"]
 [tool.uv.extra-build-variables]
 "flash_attn" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
 "vllm" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
+"tensorrt" = { NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP = "0"}
