@@ -205,7 +205,8 @@ def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
             # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
-        ).to(torch.bfloat16)
+            dtype=torch.bfloat16
+        )
         print("[P2] Model loaded.", flush=True)
 
         def encode(texts: list[str]) -> np.ndarray:
@@ -499,7 +500,8 @@ class MedicalTermSearcher:
             # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
-        ).to(torch.bfloat16)
+            dtype=torch.bfloat16
+        )
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
