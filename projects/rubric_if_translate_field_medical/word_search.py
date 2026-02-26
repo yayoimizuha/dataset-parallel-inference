@@ -34,7 +34,7 @@ _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 _DENSE_BATCH_SIZE = 4096
 _SPARSE_BATCH_SIZE = 4096
-_UPSERT_BATCH_SIZE = 10000
+_UPSERT_BATCH_SIZE = 500
 _LOADER_BATCH_SIZE = 2048
 
 _QDRANT_URL = "http://localhost:6333"
@@ -205,7 +205,7 @@ def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
             # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
-        )
+        ).to(torch.bfloat16)
         print("[P2] Model loaded.", flush=True)
 
         def encode(texts: list[str]) -> np.ndarray:
@@ -499,7 +499,7 @@ class MedicalTermSearcher:
             # quantization_config=BitsAndBytesConfig(load_in_8bit=True),
             trust_remote_code=True,
             device_map="cuda:0",
-        )
+        ).to(torch.bfloat16)
 
         self.splade = AutoModelForMaskedLM.from_pretrained(
             _SPARSE_MODEL,
