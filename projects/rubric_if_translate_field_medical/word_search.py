@@ -254,8 +254,7 @@ def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceS
                     "trt_engine_cache_path": _TRT_CACHE_DIR,
                     "trt_timing_cache_enable": True,
                     "trt_timing_cache_path": _TRT_CACHE_DIR,
-                    "trt_builder_optimization_level": str(3),
-                    "trt_build_heuristics_enable": True,
+                    "trt_builder_optimization_level": str(2),  # ヒューリスティクス有効化 (TRT 8.6+ では level 2 が旧 build_heuristics 相当)
                     "trt_force_timing_cache": True,
                     # 動的形状プロファイル: バッチサイズ=_ENCODE_BATCH_SIZE, 最大トークン長=8192
                     "trt_profile_min_shapes":
