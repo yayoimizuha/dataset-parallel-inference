@@ -40,7 +40,7 @@ from transformers import AutoTokenizer
 # 定数
 # ======================================================================
 
-_CHUNK_SIZE = 8192
+_CHUNK_SIZE = 4096  # semchunk のチャンクサイズ。ONNX モデルの max_length=8192 に対して控えめに。
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 _ENCODE_BATCH_SIZE = 4  # ONNX 推論 1 回あたりのバッチサイズ (8192 トークン長のため控えめに)
@@ -59,6 +59,7 @@ _DATASET_CONFIG = "latest.en"
 
 _OUTPUT_DIR = Path(__file__).parent / "output"
 _OUTPUT_FILENAME = "medical_terms_embeddings.parquet"
+_TRT_CACHE_DIR = _OUTPUT_DIR / "trt_cache"
 
 # センチネル: Queue の終端を示す
 _SENTINEL = None
@@ -237,16 +238,39 @@ def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceS
         sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+        # GPU ごとにキャッシュディレクトリを分離 (エンジンは GPU 固有のため)
+        trt_cache_path = str(_TRT_CACHE_DIR / f"gpu{gpu_id}")
+        os.makedirs(trt_cache_path, exist_ok=True)
+
         session = ort.InferenceSession(
             model_path,
             sess_options=sess_opts,
             providers=[
+                ("TensorrtExecutionProvider", {
+                    "device_id": str(gpu_id),
+                    "trt_fp16_enable": True,
+                    "trt_max_workspace_size": str(2147483648),  # 2 GB
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": trt_cache_path,
+                    "trt_timing_cache_enable": True,
+                    "trt_timing_cache_path": trt_cache_path,
+                    "trt_builder_optimization_level": str(3),
+                    # 動的形状プロファイル: バッチサイズ=_ENCODE_BATCH_SIZE, 最大トークン長=8192
+                    "trt_profile_min_shapes":
+                        "input_ids:1x1,attention_mask:1x1",
+                    "trt_profile_opt_shapes":
+                        f"input_ids:{_ENCODE_BATCH_SIZE}x{_CHUNK_SIZE},"
+                        f"attention_mask:{_ENCODE_BATCH_SIZE}x{_CHUNK_SIZE}",
+                    "trt_profile_max_shapes":
+                        f"input_ids:{_ENCODE_BATCH_SIZE}x8192,"
+                        f"attention_mask:{_ENCODE_BATCH_SIZE}x8192",
+                }),
                 ("CUDAExecutionProvider", {"device_id": str(gpu_id)}),
                 "CPUExecutionProvider",
             ],
         )
         sessions.append(session)
-        print(f"[Setup] ONNX session created on GPU {gpu_id}", flush=True)
+        print(f"[Setup] ONNX session created on GPU {gpu_id} (TensorRT + CUDA)", flush=True)
 
     return sessions
 
