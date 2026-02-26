@@ -23,7 +23,9 @@ dependencies = [
     "more-itertools",
     "semchunk",
     "fugashi",
-    "unidic-lite"
+    "unidic-lite",
+    "onnxruntime-gpu",
+    "polars",
 ]
 
 [build-system]

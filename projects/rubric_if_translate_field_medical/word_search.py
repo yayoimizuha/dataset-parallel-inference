@@ -1,652 +1,426 @@
 """
-4-process pipeline for medical term registration into Qdrant.
+Dense-vector embedding pipeline for medical term search.
 
-Process 1 (dataset_loader): Dataset read + chunking + duplicate check -> sends to P2, P3, P4
-Process 2 (dense_encoder):  Dense vector generation on cuda:0 -> sends to P4
-Process 3 (sparse_encoder): Sparse vector generation on cuda:1 -> sends to P4
-Process 4 (qdrant_writer):  Merges dense+sparse+meta results, upserts to Qdrant
+Architecture (streaming overlap)
+=================================
+Producer (background thread + multiprocessing.Pool):
+    Wikipedia dataset iteration
+    -> multiprocessing.Pool.imap for CPU-parallel semchunk splitting
+    -> yields encode-ready batches into asyncio.Queue
+
+Consumer (asyncio event loop, 8 GPUs):
+    Pulls batches from asyncio.Queue
+    -> tokenize -> round-robin dispatch to 8 ONNX Runtime GPU sessions
+    -> collect embeddings + metadata
+
+Output:
+    polars DataFrame -> zstd-compressed parquet
 """
-import json
+
+from __future__ import annotations
+
+import asyncio
+import multiprocessing as mp
 import os
-import sys
-import threading
-import traceback
 import uuid
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
+import polars as pl
 import semchunk
-import torch
-import torch.multiprocessing as mp
-# noinspection PyPep8Naming
-import torch.nn.functional as F
 import tqdm
-import yasem
-from datasets import load_dataset, Dataset
-from qdrant_client import QdrantClient, models
-from transformers import AutoModelForMaskedLM, AutoModel, AutoTokenizer
+from datasets import load_dataset
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 
 # ======================================================================
 # 定数
 # ======================================================================
 
-_CHUNK_SIZE = 512
+_CHUNK_SIZE = 8192
 _UUID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
-_DENSE_BATCH_SIZE = 2048
-_SPARSE_BATCH_SIZE = 2048
-_UPSERT_BATCH_SIZE = 500
-_LOADER_BATCH_SIZE = 8192
-_RETRIEVE_BATCH_SIZE = 1000  # Qdrant 登録済みチェック用バッチサイズ
-_NUM_PROC = max(1, (os.cpu_count() or 1) - 4)  # チャンク分割の並列ワーカー数
+_ENCODE_BATCH_SIZE = 512  # ONNX 推論 1 回あたりのバッチサイズ
+_QUEUE_MAXSIZE = 32  # producer → consumer 間のバッファ上限
+_CONCURRENT_PER_GPU = 3  # 1 GPU あたりの同時推論バッチ数
 
-_QDRANT_URL = "http://localhost:6333"
-_COLLECTION_NAME = "medical_terms"
+_NUM_GPUS = 8
+_NUM_PROC = int(max(4, (os.cpu_count() or 1) / 2 - 10))  # semchunk 並列ワーカー数
 
-_DENSE_MODEL = "cl-nagoya/ruri-v3-310m"
-_SPARSE_MODEL = "hotchpotch/japanese-splade-v2"
+_ONNX_REPO = "sirasagi62/ruri-v3-310m-ONNX"
+_ONNX_FILENAME = "onnx/model_fp16.onnx"
+_TOKENIZER_REPO = "sirasagi62/ruri-v3-310m-ONNX"
+
 _DATASET_NAME = "omarkamali/wikipedia-monthly"
 _DATASET_CONFIG = "latest.en"
 
+_OUTPUT_DIR = Path(__file__).parent / "output"
+_OUTPUT_FILENAME = "medical_terms_embeddings.parquet"
 
-class _Sentinel:
-    """pickle 可能なパイプライン終了シグナル。"""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __reduce__(self):
-        return (self.__class__, ())
-
-
-SENTINEL = _Sentinel()
+# センチネル: Queue の終端を示す
+_SENTINEL = None
 
 
 # ======================================================================
-# ユーティリティ
+# データ構造
 # ======================================================================
 
-def _mean_pooling(model_output, attention_mask) -> torch.Tensor:
-    token_embeddings = model_output.last_hidden_state
-    mask_expanded = attention_mask.unsqueeze(-1).float()
-    sum_embeddings = (token_embeddings * mask_expanded).sum(1)
-    sum_mask = mask_expanded.sum(1).clamp(min=1e-9)
-    return sum_embeddings / sum_mask
+
+@dataclass
+class ChunkBatch:
+    """Producer から Consumer へ渡すバッチ単位のデータ。"""
+
+    point_ids: list[str]
+    article_ids: list[str]
+    titles: list[str]
+    chunk_texts: list[str]
+    chunk_indices: list[int]
 
 
-def _ensure_collection(qdrant: QdrantClient) -> None:
-    """コレクションが存在しなければ作成する。複数プロセスからの同時呼び出しに対応。"""
-    if qdrant.collection_exists(_COLLECTION_NAME):
-        return
-    try:
-        qdrant.create_collection(
-            _COLLECTION_NAME,
-            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
-            sparse_vectors_config={
-                "splade": models.SparseVectorParams(
-                    index=models.SparseIndexParams(full_scan_threshold=1000)
-                )
-            },
-        )
-    except Exception:
-        # 別プロセスが先に作成した場合は無視
-        if not qdrant.collection_exists(_COLLECTION_NAME):
-            raise
+@dataclass
+class ResultAccumulator:
+    """Consumer 側で embedding とメタデータを蓄積する。"""
 
+    point_ids: list[str] = field(default_factory=list)
+    article_ids: list[str] = field(default_factory=list)
+    titles: list[str] = field(default_factory=list)
+    chunk_texts: list[str] = field(default_factory=list)
+    chunk_indices: list[int] = field(default_factory=list)
+    embeddings: list[np.ndarray] = field(default_factory=list)
 
-def _send_batch(batch_id: int, batch_buf: list[dict[str, Any]], *queues: mp.Queue) -> None:
-    """同一バッチを複数の Queue へ送信する。"""
-    msg = (batch_id, batch_buf)
-    for q in queues:
-        q.put(msg)
+    def extend(self, batch: ChunkBatch, emb: np.ndarray) -> None:
+        self.point_ids.extend(batch.point_ids)
+        self.article_ids.extend(batch.article_ids)
+        self.titles.extend(batch.titles)
+        self.chunk_texts.extend(batch.chunk_texts)
+        self.chunk_indices.extend(batch.chunk_indices)
+        self.embeddings.append(emb)
 
 
 # ======================================================================
-# Process 1: Dataset loader
+# ユーティリティ (numpy)
 # ======================================================================
 
-def _chunk_article(batch: dict[str, list]) -> dict[str, list]:
-    """
-    datasets.map() 用のバッチ処理関数。
-    記事をチャンク分割し、1チャンク1行に展開する (flat_map 相当)。
-    """
-    chunker = _get_chunker()
 
-    out_point_id: list[str] = []
-    out_article_id: list[str] = []
-    out_title: list[str] = []
-    out_chunk_text: list[str] = []
-    out_chunk_index: list[int] = []
-
-    for data_id, title, text in zip(batch["id"], batch["title"], batch["text"]):
-        chunks = chunker(text)
-        for ci, chunk in enumerate(chunks):
-            out_point_id.append(str(uuid.uuid5(_UUID_NAMESPACE, f"{data_id}_{ci}")))
-            out_article_id.append(data_id)
-            out_title.append(title)
-            out_chunk_text.append(chunk)
-            out_chunk_index.append(ci)
-
-    return {
-        "point_id": out_point_id,
-        "article_id": out_article_id,
-        "title": out_title,
-        "chunk_text": out_chunk_text,
-        "chunk_index": out_chunk_index,
-    }
+def _l2_normalize(embeddings: np.ndarray) -> np.ndarray:
+    """L2-normalize each row vector."""
+    norms = np.linalg.norm(embeddings, ord=2, axis=1, keepdims=True)
+    norms = np.clip(norms, a_min=1e-12, a_max=None)
+    return embeddings / norms
 
 
-# ワーカーごとに chunker を1回だけ初期化 (プロセスセーフ)
+# ======================================================================
+# Producer: Dataset loading + CPU parallel chunking → asyncio.Queue
+# ======================================================================
+
+# multiprocessing ワーカーごとの chunker キャッシュ
 _chunker_cache = None
 
 
 def _get_chunker():
     global _chunker_cache
     if _chunker_cache is None:
-        _tok = AutoTokenizer.from_pretrained(_SPARSE_MODEL)
+        tok = AutoTokenizer.from_pretrained(_TOKENIZER_REPO)
         # noinspection PyTypeChecker
-        _chunker_cache = semchunk.chunkerify(_tok, chunk_size=_CHUNK_SIZE)
+        _chunker_cache = semchunk.chunkerify(tok, chunk_size=_CHUNK_SIZE)
     return _chunker_cache
 
 
-def dataset_loader(
-    to_dense_q: mp.Queue,
-    to_sparse_q: mp.Queue,
-    to_writer_q: mp.Queue,
+def _chunk_one_article(article: dict) -> list[dict]:
+    """
+    1 記事をチャンク分割する。multiprocessing.Pool のワーカー関数。
+
+    Returns:
+        チャンクごとの dict のリスト。
+    """
+    chunker = _get_chunker()
+    data_id = article["id"]
+    title = article["title"]
+    text = article["text"]
+
+    results = []
+    for ci, chunk in enumerate(chunker(text)):
+        results.append({
+            "point_id": str(uuid.uuid5(_UUID_NAMESPACE, f"{data_id}_{ci}")),
+            "article_id": data_id,
+            "title": title,
+            "chunk_text": chunk,
+            "chunk_index": ci,
+        })
+    return results
+
+
+def _producer_thread(
+        queue: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+        total_articles: int | None,
 ) -> None:
     """
-    Wikipedia データセットを読み込み、チャンク分割 (並列) ・未登録チェック (バッチ) を行い、
-    バッチ単位で P2 (dense), P3 (sparse), P4 (メタデータ) へ送信する。
+    バックグラウンドスレッドで実行。
+    multiprocessing.Pool で記事を並列チャンク分割し、
+    _ENCODE_BATCH_SIZE 件ごとに ChunkBatch として asyncio.Queue に投入する。
     """
-    try:
-        print(f"[P1] Starting dataset loader (num_proc={_NUM_PROC})...", flush=True)
+    wiki = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
+    print(f"[Producer] Dataset loaded: {len(wiki)} articles", flush=True)
 
-        # ----------------------------------------------------------
-        # Phase 1a: データセット読み込み + チャンク分割 (並列)
-        # ----------------------------------------------------------
-        wiki_dataset = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
-        print(f"[P1] Dataset loaded: {len(wiki_dataset)} articles", flush=True)
+    batch_buf: list[dict] = []
 
-        chunked: Dataset = wiki_dataset.map(
-            _chunk_article,
-            batched=True,
-            batch_size=1000,
-            num_proc=_NUM_PROC,
-            remove_columns=wiki_dataset.column_names,
-            desc="[P1] Chunking (parallel)",
+    def _flush_batch() -> None:
+        nonlocal batch_buf
+        if not batch_buf:
+            return
+        cb = ChunkBatch(
+            point_ids=[d["point_id"] for d in batch_buf],
+            article_ids=[d["article_id"] for d in batch_buf],
+            titles=[d["title"] for d in batch_buf],
+            chunk_texts=[d["chunk_text"] for d in batch_buf],
+            chunk_indices=[d["chunk_index"] for d in batch_buf],
         )
-        print(f"[P1] Chunking done: {len(chunked)} chunks", flush=True)
+        # スレッドセーフに asyncio.Queue へ put
+        future = asyncio.run_coroutine_threadsafe(queue.put(cb), loop)
+        future.result()  # バックプレッシャ: Queue が満杯なら待つ
+        batch_buf = []
 
-        # ----------------------------------------------------------
-        # Phase 1b: 登録済みチェック (バッチ)
-        # ----------------------------------------------------------
-        qdrant = QdrantClient(url=_QDRANT_URL)
-        _ensure_collection(qdrant)
+    progress = tqdm.tqdm(total=total_articles, desc="[Producer] Chunking")
 
-        all_point_ids: list[str] = chunked["point_id"]
-        existing_ids: set[str] = set()
+    with mp.Pool(processes=_NUM_PROC) as pool:
+        for chunks in pool.imap_unordered(_chunk_one_article, wiki, chunksize=64):
+            batch_buf.extend(chunks)
+            progress.update(1)
+            while len(batch_buf) >= _ENCODE_BATCH_SIZE:
+                to_send = batch_buf[:_ENCODE_BATCH_SIZE]
+                batch_buf = batch_buf[_ENCODE_BATCH_SIZE:]
+                cb = ChunkBatch(
+                    point_ids=[d["point_id"] for d in to_send],
+                    article_ids=[d["article_id"] for d in to_send],
+                    titles=[d["title"] for d in to_send],
+                    chunk_texts=[d["chunk_text"] for d in to_send],
+                    chunk_indices=[d["chunk_index"] for d in to_send],
+                )
+                future = asyncio.run_coroutine_threadsafe(queue.put(cb), loop)
+                future.result()
 
-        for i in tqdm.trange(0, len(all_point_ids), _RETRIEVE_BATCH_SIZE,
-                             desc="[P1] Checking existing"):
-            batch_ids = all_point_ids[i: i + _RETRIEVE_BATCH_SIZE]
-            found = qdrant.retrieve(
-                _COLLECTION_NAME, ids=batch_ids, with_payload=False, with_vectors=False,
-            )
-            existing_ids.update(p.id for p in found)
+    # 残余フラッシュ
+    _flush_batch()
+    progress.close()
 
-        print(f"[P1] {len(existing_ids)} chunks already registered", flush=True)
-
-        # ----------------------------------------------------------
-        # Phase 1c: 未登録チャンクを Queue へ送信
-        # ----------------------------------------------------------
-        batch_buf: list[dict[str, Any]] = []
-        batch_id = 0
-        sent_chunks = 0
-
-        for idx in tqdm.trange(len(chunked), desc="[P1] Sending"):
-            pid = chunked[idx]["point_id"]
-            if pid in existing_ids:
-                continue
-            batch_buf.append({
-                "point_id": pid,
-                "article_id": chunked[idx]["article_id"],
-                "title": chunked[idx]["title"],
-                "chunk_text": chunked[idx]["chunk_text"],
-                "chunk_index": chunked[idx]["chunk_index"],
-            })
-            if len(batch_buf) >= _LOADER_BATCH_SIZE:
-                _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
-                sent_chunks += len(batch_buf)
-                print(f"[P1] Sent batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
-                batch_id += 1
-                batch_buf = []
-
-        if batch_buf:
-            _send_batch(batch_id, batch_buf, to_dense_q, to_sparse_q, to_writer_q)
-            sent_chunks += len(batch_buf)
-            print(f"[P1] Sent final batch {batch_id} ({len(batch_buf)} chunks, total {sent_chunks})", flush=True)
-
-        # 終了シグナル
-        for q in (to_dense_q, to_sparse_q, to_writer_q):
-            q.put(SENTINEL)
-
-        qdrant.close()
-        print(f"[P1] Done. Total {sent_chunks} chunks sent.", flush=True)
-
-    except Exception:
-        traceback.print_exc()
-        sys.stdout.flush()
-        for q in (to_dense_q, to_sparse_q, to_writer_q):
-            try:
-                q.put(SENTINEL)
-            except Exception:
-                pass
-        raise
+    # 終端シグナル
+    future = asyncio.run_coroutine_threadsafe(queue.put(_SENTINEL), loop)
+    future.result()
+    print("[Producer] Done.", flush=True)
 
 
 # ======================================================================
-# Process 2: Dense encoder (cuda:0)
+# ONNX Runtime session management
 # ======================================================================
 
-def dense_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
-    """ruri-v3-310m で dense ベクトルを生成し、結果を P4 へ送る。"""
-    try:
-        print("[P2] Starting dense encoder on cuda:0...", flush=True)
 
-        tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
-        tokenizer.model_max_length = 8192  # ruri-v3 は 8192 対応だが tokenizer 設定が 512 のまま
-        model = AutoModel.from_pretrained(
-            _DENSE_MODEL,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to("cuda:0").eval()
-        print("[P2] Model loaded.", flush=True)
-
-        def encode(texts: list[str]) -> np.ndarray:
-            encoded = tokenizer(
-                texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
-            )
-            encoded = {k: v.to("cuda:0") for k, v in encoded.items()}
-            with torch.no_grad():
-                output = model(**encoded)
-            emb = _mean_pooling(output, encoded["attention_mask"])
-            emb = F.normalize(emb, p=2, dim=1)
-            return emb.cpu().float().numpy()
-
-        while True:
-            item = in_q.get()
-            if isinstance(item, _Sentinel):
-                out_q.put(SENTINEL)
-                break
-
-            batch_id, chunk_dicts = item
-            texts = [f"検索文書: {d['chunk_text']}" for d in chunk_dicts]
-
-            all_embs = [
-                encode(texts[i: i + _DENSE_BATCH_SIZE])
-                for i in range(0, len(texts), _DENSE_BATCH_SIZE)
-            ]
-            out_q.put((batch_id, np.concatenate(all_embs, axis=0)))
-            print(f"[P2] Dense batch {batch_id} done ({len(texts)} chunks)", flush=True)
-
-        torch.cuda.empty_cache()
-        print("[P2] Done.", flush=True)
-
-    except Exception:
-        traceback.print_exc()
-        sys.stdout.flush()
-        # P4 がハングしないように終了シグナルを送る
-        try:
-            out_q.put(SENTINEL)
-        except Exception:
-            pass
-        raise
+def _download_onnx_model() -> str:
+    """HuggingFace Hub から ONNX モデルをダウンロードし、ローカルパスを返す。"""
+    print(f"[Setup] Downloading ONNX model: {_ONNX_REPO}/{_ONNX_FILENAME}", flush=True)
+    local_path = hf_hub_download(repo_id=_ONNX_REPO, filename=_ONNX_FILENAME)
+    print(f"[Setup] Model cached at: {local_path}", flush=True)
+    return local_path
 
 
-# ======================================================================
-# Process 3: Sparse encoder (cuda:1)
-# ======================================================================
+def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceSession]:
+    """各 GPU に ONNX Runtime セッションを 1 つずつ作成する。"""
+    sessions: list[ort.InferenceSession] = []
+    threads_per_gpu = max(1, (os.cpu_count() or 8) // num_gpus)
 
-def sparse_encoder(in_q: mp.Queue, out_q: mp.Queue) -> None:
-    """japanese-splade-v2 で sparse ベクトルを生成し、結果を P4 へ送る。"""
-    try:
-        print("[P3] Starting sparse encoder on cuda:1...", flush=True)
+    for gpu_id in range(num_gpus):
+        sess_opts = ort.SessionOptions()
+        sess_opts.intra_op_num_threads = threads_per_gpu
+        sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        splade_model = AutoModelForMaskedLM.from_pretrained(
-            _SPARSE_MODEL,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to("cuda:1").eval()
-        # noinspection PyTypeChecker
-        splade_embedder = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:1")
-        splade_embedder.model = splade_model
-        print("[P3] Model loaded.", flush=True)
-
-        def encode(texts: list[str]) -> list[dict]:
-            sparse_matrix = splade_embedder.encode(texts, convert_to_csr_matrix=True)
-            return [
-                {"indices": sparse_matrix.getrow(i).indices.tolist(),
-                 "values": sparse_matrix.getrow(i).data.tolist()}
-                for i in range(sparse_matrix.shape[0])
-            ]
-
-        while True:
-            item = in_q.get()
-            if isinstance(item, _Sentinel):
-                out_q.put(SENTINEL)
-                break
-
-            batch_id, chunk_dicts = item
-            texts = [d["chunk_text"] for d in chunk_dicts]
-
-            all_sparse: list[dict] = []
-            for i in range(0, len(texts), _SPARSE_BATCH_SIZE):
-                all_sparse.extend(encode(texts[i: i + _SPARSE_BATCH_SIZE]))
-
-            out_q.put((batch_id, all_sparse))
-            print(f"[P3] Sparse batch {batch_id} done ({len(texts)} chunks)", flush=True)
-
-        torch.cuda.empty_cache()
-        print("[P3] Done.", flush=True)
-
-    except Exception:
-        traceback.print_exc()
-        sys.stdout.flush()
-        try:
-            out_q.put(SENTINEL)
-        except Exception:
-            pass
-        raise
-
-
-# ======================================================================
-# Process 4: Qdrant writer
-# ======================================================================
-
-_REQUIRED_KEYS = frozenset({"meta", "dense", "sparse"})
-
-
-def qdrant_writer(
-    from_loader_q: mp.Queue,
-    from_dense_q: mp.Queue,
-    from_sparse_q: mp.Queue,
-) -> None:
-    """
-    P1 からメタデータ、P2 から dense、P3 から sparse を受け取り、
-    同じ batch_id のデータが揃ったら Qdrant へ upsert する。
-    """
-    try:
-        print("[P4] Starting Qdrant writer...", flush=True)
-
-        qdrant = QdrantClient(url=_QDRANT_URL)
-        _ensure_collection(qdrant)
-
-        pending: dict[int, dict[str, Any]] = {}
-        finished_sources = 0
-        lock = threading.Lock()
-        upsert_event = threading.Event()
-        done_event = threading.Event()
-
-        # -- 汎用レシーバー --------------------------------------------
-
-        def _receiver(queue: mp.Queue, key: str) -> None:
-            """Queue から受信し pending[batch_id][key] に格納する。"""
-            nonlocal finished_sources
-            while True:
-                item = queue.get()
-                if isinstance(item, _Sentinel):
-                    with lock:
-                        finished_sources += 1
-                        if finished_sources >= 3:
-                            done_event.set()
-                    upsert_event.set()
-                    return
-                batch_id, data = item
-                with lock:
-                    pending.setdefault(batch_id, {})[key] = data
-                upsert_event.set()
-
-        # -- upsert ----------------------------------------------------
-
-        def _do_upsert(bid: int) -> None:
-            entry = pending.get(bid)
-            if entry is None or not _REQUIRED_KEYS <= entry.keys():
-                return
-
-            chunk_dicts = entry["meta"]
-            dense_vecs = entry["dense"]
-            sparse_dicts = entry["sparse"]
-
-            for i in range(0, len(chunk_dicts), _UPSERT_BATCH_SIZE):
-                items = chunk_dicts[i: i + _UPSERT_BATCH_SIZE]
-                d_vecs = dense_vecs[i: i + _UPSERT_BATCH_SIZE]
-                s_vecs = sparse_dicts[i: i + _UPSERT_BATCH_SIZE]
-
-                points = [
-                    models.PointStruct(
-                        id=meta["point_id"],
-                        vector={
-                            "": dense.tolist(),
-                            "splade": models.SparseVector(
-                                indices=sparse["indices"], values=sparse["values"],
-                            ),
-                        },
-                        payload={
-                            "article_id": meta["article_id"],
-                            "title": meta["title"],
-                            "chunk_text": meta["chunk_text"],
-                            "chunk_index": meta["chunk_index"],
-                        },
-                    )
-                    for meta, dense, sparse in zip(items, d_vecs, s_vecs)
-                ]
-                qdrant.upsert(_COLLECTION_NAME, points=points)
-
-            print(f"[P4] Upserted batch {bid} ({len(chunk_dicts)} points)", flush=True)
-            del pending[bid]
-
-        # -- 3 つの Queue を並行受信するスレッドを起動 -----------------
-
-        threads = [
-            threading.Thread(target=_receiver, args=(from_loader_q, "meta"), daemon=True),
-            threading.Thread(target=_receiver, args=(from_dense_q, "dense"), daemon=True),
-            threading.Thread(target=_receiver, args=(from_sparse_q, "sparse"), daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
-        # -- メインスレッドで upsert を処理 ----------------------------
-
-        while True:
-            upsert_event.wait(timeout=1.0)
-            upsert_event.clear()
-
-            with lock:
-                ready = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
-            for bid in sorted(ready):
-                _do_upsert(bid)
-
-            if done_event.is_set():
-                with lock:
-                    remaining = [bid for bid, e in pending.items() if _REQUIRED_KEYS <= e.keys()]
-                for bid in sorted(remaining):
-                    _do_upsert(bid)
-                break
-
-        for t in threads:
-            t.join()
-        qdrant.close()
-        print("[P4] Done.", flush=True)
-
-    except Exception:
-        traceback.print_exc()
-        sys.stdout.flush()
-        raise
-
-
-# ======================================================================
-# パイプラインオーケストレーション
-# ======================================================================
-
-def run_parallel_registration() -> None:
-    """
-    4 プロセスをパイプラインで並列実行し、Qdrant に登録する。
-
-    P1 --batch--> P2 (cuda:0, dense) --result--> P4 (Qdrant upsert)
-    P1 --batch--> P3 (cuda:1, sparse) --result--> P4
-    P1 --meta---> P4
-    """
-    mp.set_start_method("spawn", force=True)
-
-    loader_to_dense: mp.Queue = mp.Queue(maxsize=8)
-    loader_to_sparse: mp.Queue = mp.Queue(maxsize=8)
-    loader_to_writer: mp.Queue = mp.Queue(maxsize=8)
-    dense_to_writer: mp.Queue = mp.Queue(maxsize=8)
-    sparse_to_writer: mp.Queue = mp.Queue(maxsize=8)
-
-    processes = [
-        mp.Process(target=dataset_loader,
-                   args=(loader_to_dense, loader_to_sparse, loader_to_writer),
-                   name="P1-Loader"),
-        mp.Process(target=dense_encoder,
-                   args=(loader_to_dense, dense_to_writer),
-                   name="P2-Dense"),
-        mp.Process(target=sparse_encoder,
-                   args=(loader_to_sparse, sparse_to_writer),
-                   name="P3-Sparse"),
-        mp.Process(target=qdrant_writer,
-                   args=(loader_to_writer, dense_to_writer, sparse_to_writer),
-                   name="P4-Qdrant"),
-    ]
-
-    for p in processes:
-        p.start()
-    for p in processes:
-        p.join()
-
-    # 異常終了したプロセスを報告
-    failed = [p for p in processes if p.exitcode != 0]
-    if failed:
-        names = ", ".join(f"{p.name} (exit={p.exitcode})" for p in failed)
-        raise RuntimeError(f"Processes failed: {names}")
-
-    print("All processes finished.")
-
-
-# ======================================================================
-# 検索 (単一プロセス・既存互換)
-# ======================================================================
-
-class MedicalTermSearcher:
-    """検索用クラス。登録は run_parallel_registration() で行う。"""
-
-    def __init__(self):
-        self.qdrant_db = QdrantClient(url=_QDRANT_URL)
-        _ensure_collection(self.qdrant_db)
-
-        # noinspection PyNoneFunctionAssignment
-        self.ruri_tokenizer = AutoTokenizer.from_pretrained(_DENSE_MODEL)
-        self.ruri_tokenizer.model_max_length = 8192
-        self.embedding = AutoModel.from_pretrained(
-            _DENSE_MODEL,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to("cuda:0").eval()
-
-        self.splade = AutoModelForMaskedLM.from_pretrained(
-            _SPARSE_MODEL,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to("cuda:0").eval()
-        # noinspection PyTypeChecker
-        self._yasem = yasem.SpladeEmbedder(_SPARSE_MODEL, device="cuda:0")
-        self._yasem.model = self.splade
-
-    def close(self) -> None:
-        self.qdrant_db.close()
-
-    def _encode_dense(self, texts: list[str]) -> np.ndarray:
-        encoded = self.ruri_tokenizer(
-            texts, padding=True, truncation=True, max_length=8192, return_tensors="pt",
-        )
-        encoded = {k: v.to("cuda:0") for k, v in encoded.items()}
-        with torch.no_grad():
-            output = self.embedding(**encoded)
-        emb = _mean_pooling(output, encoded["attention_mask"])
-        emb = F.normalize(emb, p=2, dim=1)
-        return emb.cpu().float().numpy()
-
-    def _encode_sparse(self, texts: list[str]) -> list[models.SparseVector]:
-        sparse_matrix = self._yasem.encode(texts, convert_to_csr_matrix=True)
-        return [
-            models.SparseVector(
-                indices=sparse_matrix.getrow(i).indices.tolist(),
-                values=sparse_matrix.getrow(i).data.tolist(),
-            )
-            for i in range(sparse_matrix.shape[0])
-        ]
-
-    def search_medical_term(self, _term: str) -> str:
-        dense_vec = self._encode_dense([f"検索クエリ: {_term}"])[0].tolist()
-        sparse_vec = self._encode_sparse([_term])[0]
-
-        results = self.qdrant_db.query_points_groups(
-            collection_name=_COLLECTION_NAME,
-            prefetch=[
-                models.Prefetch(query=dense_vec, using="", limit=20),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse_vec.indices, values=sparse_vec.values,
-                    ),
-                    using="splade",
-                    limit=20,
-                ),
+        session = ort.InferenceSession(
+            model_path,
+            sess_options=sess_opts,
+            providers=[
+                ("CUDAExecutionProvider", {"device_id": str(gpu_id)}),
+                "CPUExecutionProvider",
             ],
-            query=models.FusionQuery(fusion=models.Fusion.RRF),  # type: ignore[arg-type]
-            group_by="article_id",
-            group_size=3,
-            limit=5,
-            with_payload=True,
         )
+        sessions.append(session)
+        print(f"[Setup] ONNX session created on GPU {gpu_id}", flush=True)
 
-        hits = []
-        for group in results.groups:
-            chunks = []
-            title = None
-            for point in group.hits:
-                p = point.payload or {}
-                if title is None:
-                    title = p.get("title")
-                chunks.append({
-                    "chunk_text": p.get("chunk_text"),
-                    "chunk_index": p.get("chunk_index"),
-                    "score": point.score,
-                })
-            chunks.sort(key=lambda c: c.get("chunk_index", 0))
-            hits.append({
-                "article_id": group.id,
-                "title": title,
-                "chunks": chunks,
-                "ja_title": None,
-                "ja_url": None,
-            })
+    return sessions
 
-        return json.dumps({"results": hits}, ensure_ascii=False, indent=2)
+
+# ======================================================================
+# Consumer: async GPU inference
+# ======================================================================
+
+
+def _run_inference(
+        session: ort.InferenceSession,
+        input_ids: np.ndarray,
+        attention_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    1 バッチの ONNX 推論を実行し、L2 正規化済み dense embedding を返す。
+    ThreadPoolExecutor 内から呼び出される (GIL は ORT の C++ 層で解放)。
+
+    ONNX モデル出力:
+        - token_embeddings: (batch, seq_len, 768) — 各トークンの隠れ状態
+        - sentence_embedding: (batch, 768) — pooling 済み文ベクトル
+    """
+    outputs = session.run(
+        ["sentence_embedding"],
+        {"input_ids": input_ids, "attention_mask": attention_mask},
+    )
+    sentence_embedding = outputs[0]  # (batch, 768), float32
+    return _l2_normalize(sentence_embedding)
+
+
+async def _consumer(
+        queue: asyncio.Queue,
+        sessions: list[ort.InferenceSession],
+        tokenizer: AutoTokenizer,
+        result: ResultAccumulator,
+) -> None:
+    """
+    asyncio.Queue からバッチを取り出し、8 GPU にラウンドロビンで推論を投入する。
+    GPU ごとにセマフォで排他制御し、各 GPU が常に最大 _CONCURRENT_PER_GPU バッチ
+    処理中になるようパイプラインを飽和させる。
+    """
+    num_gpus = len(sessions)
+    executor = ThreadPoolExecutor(max_workers=num_gpus * _CONCURRENT_PER_GPU)
+    gpu_sems = [asyncio.Semaphore(_CONCURRENT_PER_GPU) for _ in range(num_gpus)]
+    batch_counter = 0
+    progress = tqdm.tqdm(desc="[Consumer] Encoding", unit="batch")
+
+    async def _process_one(batch: ChunkBatch, gpu_id: int) -> None:
+        prefixed = [f"検索文書: {t}" for t in batch.chunk_texts]
+        encoded = tokenizer(
+            prefixed,
+            padding=True,
+            truncation=True,
+            max_length=8192,
+            return_tensors="np",
+        )
+        input_ids = encoded["input_ids"].astype(np.int64)
+        attention_mask = encoded["attention_mask"].astype(np.int64)
+
+        loop = asyncio.get_event_loop()
+        async with gpu_sems[gpu_id]:
+            emb = await loop.run_in_executor(
+                executor, _run_inference, sessions[gpu_id], input_ids, attention_mask,
+            )
+
+        result.extend(batch, emb)
+        progress.update(1)
+
+    pending_tasks: list[asyncio.Task] = []
+
+    while True:
+        item = await queue.get()
+        if item is _SENTINEL:
+            break
+
+        gpu_id = batch_counter % num_gpus
+        batch_counter += 1
+        task = asyncio.create_task(_process_one(item, gpu_id))
+        pending_tasks.append(task)
+
+    # 残りの推論タスクを待機
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks)
+
+    progress.close()
+    executor.shutdown(wait=True)
+    print(f"[Consumer] Done. {batch_counter} batches processed.", flush=True)
+
+
+# ======================================================================
+# Parquet output
+# ======================================================================
+
+
+def _save_to_parquet(result: ResultAccumulator, output_path: Path) -> None:
+    """蓄積した結果を polars DataFrame にまとめて parquet で保存する。"""
+    total = len(result.point_ids)
+    print(f"[Output] Building polars DataFrame ({total} rows)...", flush=True)
+
+    all_embeddings = np.concatenate(result.embeddings, axis=0)
+
+    df = pl.DataFrame(
+        {
+            "point_id": result.point_ids,
+            "article_id": result.article_ids,
+            "title": result.titles,
+            "chunk_text": result.chunk_texts,
+            "chunk_index": pl.Series(result.chunk_indices, dtype=pl.UInt32),
+            "embedding": [row.tolist() for row in all_embeddings],
+        }
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(output_path, compression="zstd")
+    size_gb = output_path.stat().st_size / 1e9
+    print(f"[Output] Saved to {output_path} ({size_gb:.2f} GB, {total} rows)", flush=True)
 
 
 # ======================================================================
 # エントリーポイント
 # ======================================================================
 
-if __name__ == "__main__":
-    run_parallel_registration()
 
-    searcher = MedicalTermSearcher()
-    try:
-        print(searcher.search_medical_term("juxtaglomerular apparatus"))
-    finally:
-        searcher.close()
+async def _async_main() -> None:
+    # ------------------------------------------------------------------
+    # Setup: ONNX model + sessions + tokenizer
+    # ------------------------------------------------------------------
+    model_path = _download_onnx_model()
+    sessions = _create_onnx_sessions(model_path, _NUM_GPUS)
+    tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_REPO)
+    tokenizer.model_max_length = 8192
+
+    # ------------------------------------------------------------------
+    # 記事数を先に取得 (progress bar 用)
+    # ------------------------------------------------------------------
+    wiki_meta = load_dataset(_DATASET_NAME, _DATASET_CONFIG, split="train", streaming=False)
+    total_articles = len(wiki_meta)
+    del wiki_meta
+    print(f"[Main] Total articles: {total_articles}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Producer → Consumer をオーバーラップ実行
+    # ------------------------------------------------------------------
+    queue: asyncio.Queue[ChunkBatch | None] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+    result = ResultAccumulator()
+
+    loop = asyncio.get_event_loop()
+
+    # Producer をバックグラウンドスレッドで起動
+    producer_future = loop.run_in_executor(
+        None, _producer_thread, queue, loop, total_articles,
+    )
+
+    # Consumer は asyncio タスクとして実行
+    await _consumer(queue, sessions, tokenizer, result)
+
+    # Producer スレッドの終了を待機
+    await producer_future
+
+    del sessions
+    print(f"[Main] All encoding done. Total chunks: {len(result.point_ids)}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Parquet 出力
+    # ------------------------------------------------------------------
+    _save_to_parquet(result, _OUTPUT_DIR / _OUTPUT_FILENAME)
+    print("Pipeline completed.", flush=True)
+
+
+def main() -> None:
+    """同期エントリーポイント。"""
+    mp.set_start_method("spawn", force=True)
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
