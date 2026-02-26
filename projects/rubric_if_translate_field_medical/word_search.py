@@ -239,7 +239,7 @@ def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceS
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         # GPU ごとにキャッシュディレクトリを分離 (エンジンは GPU 固有のため)
-        trt_cache_path = str(_TRT_CACHE_DIR / f"gpu{gpu_id}")
+        # trt_cache_path = str(_TRT_CACHE_DIR / f"gpu{gpu_id}")
         os.makedirs(trt_cache_path, exist_ok=True)
 
         session = ort.InferenceSession(
@@ -251,9 +251,9 @@ def _create_onnx_sessions(model_path: str, num_gpus: int) -> list[ort.InferenceS
                     "trt_fp16_enable": True,
                     "trt_max_workspace_size": str(2147483648),  # 2 GB
                     "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": trt_cache_path,
+                    "trt_engine_cache_path": _TRT_CACHE_DIR,
                     "trt_timing_cache_enable": True,
-                    "trt_timing_cache_path": trt_cache_path,
+                    "trt_timing_cache_path": _TRT_CACHE_DIR,
                     "trt_builder_optimization_level": str(3),
                     # 動的形状プロファイル: バッチサイズ=_ENCODE_BATCH_SIZE, 最大トークン長=8192
                     "trt_profile_min_shapes":
