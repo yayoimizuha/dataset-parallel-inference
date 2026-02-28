@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Iterator
 
 import aiohttp
+import httpx
 import jsonpath_ng
 import tqdm
 from datasets import load_dataset
 from dotenv import load_dotenv
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
 from openai.types.chat import (
     ChatCompletionUserMessageParam,
     ChatCompletionAssistantMessageParam,
@@ -133,7 +134,18 @@ class Task(InferenceTask):
             "CREATE TABLE IF NOT EXISTS translate(id INT PRIMARY KEY,content TEXT,loc TEXT,source TEXT,reason TEXT);"
         )
         load_dotenv(path.join(dirname(__file__), ".env"))
-        self._client = AsyncOpenAI(api_key=os.environ["API_KEY"], base_url=os.environ["BASE_URL"], timeout=None)
+        self._client = AsyncOpenAI(
+            api_key=os.environ["API_KEY"],
+            base_url=os.environ["BASE_URL"],
+            timeout=None,
+            http_client=DefaultAsyncHttpxClient(
+                limits=httpx.Limits(
+                    max_connections=4096,
+                    max_keepalive_connections=4096,
+                    keepalive_expiry=120,
+                ),
+            ),
+        )
         self.function_definitions = _parse_function_definitions(
             Path(__file__).parent.joinpath("functions").glob("*.py"))
         self.dataset = load_dataset("NovelHacja/RubricHub_v1_config", "medical", split="train",
@@ -148,10 +160,14 @@ class Task(InferenceTask):
             model_provider_text = f"{model_provider}製の"
         self._system_prompt = f"あなたは{model_provider_text}大規模言語モデル、{model_name}です。広範な知識を伴う言語理解力やユーザ指示への忠実性に秀でており、完全な回答を提供します。"
 
-        # aiohttp セッション (イベントループ起動後に遅延初期化)
+        # aiohttp セッション (function_server 向け、接続を使い回す)
         self._http_session: aiohttp.ClientSession = aiohttp.ClientSession(
             base_url=_FUNCTION_SERVER_BASE,
-            connector=aiohttp.TCPConnector(limit=0),
+            connector=aiohttp.TCPConnector(
+                limit=256,              # 同時接続数上限
+                keepalive_timeout=120,  # keep-alive 維持秒数
+                enable_cleanup_closed=True,
+            ),
             timeout=aiohttp.ClientTimeout(total=60),
         )
 
