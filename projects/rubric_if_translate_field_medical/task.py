@@ -59,7 +59,7 @@ TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
                         "description": (
                             "検索キーワード（英語の医学用語のみ）。"
                             "「Japanese」「translation」「meaning」「日本語」などのメタワードは絶対に含めないこと。"
-                            "文ではなく単語・用語で指定すること。例: 'juxtaglomerular apparatus'"
+                            "文ではなく単語・用語で指定すること。短いほど良い。　例: 'juxtaglomerular apparatus'"
                         ),
                     },
                     "size": {
