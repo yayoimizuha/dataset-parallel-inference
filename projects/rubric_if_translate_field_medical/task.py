@@ -140,9 +140,8 @@ class Task(InferenceTask):
             timeout=None,
             http_client=DefaultAsyncHttpxClient(
                 limits=httpx.Limits(
-                    max_connections=4096,
-                    max_keepalive_connections=4096,
-                    keepalive_expiry=120,
+                    max_connections=8192,
+                    max_keepalive_connections=8192,
                 ),
             ),
         )
@@ -164,11 +163,9 @@ class Task(InferenceTask):
         self._http_session: aiohttp.ClientSession = aiohttp.ClientSession(
             base_url=_FUNCTION_SERVER_BASE,
             connector=aiohttp.TCPConnector(
-                limit=256,              # 同時接続数上限
-                keepalive_timeout=120,  # keep-alive 維持秒数
+                limit=8192,              # 同時接続数上限
                 enable_cleanup_closed=True,
             ),
-            timeout=aiohttp.ClientTimeout(total=60),
         )
 
         # SQLite は同時アクセス不可なので asyncio.Lock で排他制御
