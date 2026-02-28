@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import asyncio
+import traceback
 from os import path
 from os.path import dirname, basename
 from pathlib import Path
@@ -272,9 +273,7 @@ class Task(InferenceTask):
                             # print(last_resp.choices[0].message.tool_calls or last_resp.choices[0].message.content)
                             break
                         except (OpenAIError, ValueError) as e:
-                            cause = e.__cause__
-                            print(f"order[{order}]: OpenAI API Error: {e}"
-                                  + (f" caused by {type(cause).__name__}: {cause}" if cause else ""))
+                            print(f"order[{order}]: OpenAI API Error:\n{traceback.format_exc()}")
                             if sleep_time > 32.0:
                                 bar.update(1)
                                 return
@@ -321,9 +320,7 @@ class Task(InferenceTask):
                             )
                             break
                         except (OpenAIError, ValueError) as e:
-                            cause = e.__cause__
-                            print(f"order[{order}]: OpenAI API Error: {e}"
-                                  + (f" caused by {type(cause).__name__}: {cause}" if cause else ""))
+                            print(f"order[{order}]: OpenAI API Error:\n{traceback.format_exc()}")
                             if sleep_time > 32.0:
                                 bar.update(1)
                                 return
