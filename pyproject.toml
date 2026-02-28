@@ -29,7 +29,7 @@ dependencies = [
     "tensorrt",
     "elasticsearch",
     "duckdb",
-    "fastapi",
+    "fastapi[standard]",
 ]
 
 [build-system]
