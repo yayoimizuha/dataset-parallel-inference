@@ -140,7 +140,11 @@ class Task(InferenceTask):
             base_url=os.environ["BASE_URL"],
             timeout=None,
             http_client=DefaultAioHttpClient(
-                limits=httpx.Limits(max_connections=8192, max_keepalive_connections=8192),
+                limits=httpx.Limits(
+                    max_connections=256,
+                    max_keepalive_connections=256,
+                    keepalive_expiry=120,
+                ),
             )
         )
         self.function_definitions = _parse_function_definitions(
@@ -161,7 +165,7 @@ class Task(InferenceTask):
         self._http_session: aiohttp.ClientSession = aiohttp.ClientSession(
             base_url=_FUNCTION_SERVER_BASE,
             connector=aiohttp.TCPConnector(
-                limit=8192,  # 同時接続数上限
+                limit=256,              # 同時接続数上限
                 enable_cleanup_closed=True,
             ),
         )
