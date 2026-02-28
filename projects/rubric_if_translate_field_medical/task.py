@@ -44,7 +44,7 @@ _LANGLINKS_DB = Path(__file__).parent / "en_ja_langlinks.duckdb"
 _es_client = AsyncElasticsearch(
     hosts=[{"host": _ES_HOST, "port": _ES_PORT, "scheme": "http"}],
     request_timeout=30,
-    maxsize=256,  # aiohttp コネクションプール上限 (デフォルト 10)
+    connections_per_node=int(1e4),  # ノードあたりの接続プール上限
 )
 
 # DuckDB は読み取り専用で共有 (クエリは数ms なのでイベントループ上で直接実行)
