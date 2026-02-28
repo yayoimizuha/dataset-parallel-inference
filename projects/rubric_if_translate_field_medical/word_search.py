@@ -351,6 +351,10 @@ def load_ja_articles() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_ja_title ON ja_articles (title)")
         print("[JA] Index on 'title' created.", flush=True)
 
+        # langlinks.ll_from にインデックス作成 (article_id による検索高速化)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_langlinks_ll_from ON langlinks (ll_from)")
+        print("[JA] Index on 'langlinks.ll_from' created.", flush=True)
+
     finally:
         con.close()
 
