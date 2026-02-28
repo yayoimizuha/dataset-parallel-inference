@@ -45,7 +45,7 @@ TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
         "function": {
             "name": "search_articles",
             "description": (
-                "Elasticsearch を用いて英語版 Wikipedia の医学関連記事を全文検索し、"
+                "Elasticsearch を用いて英語版 Wikipedia の記事を全文検索し、"
                 "ヒットした記事の ID・タイトル・本文の冒頭を返します。"
                 "翻訳時に専門用語の正確な意味や文脈を確認したい場合に利用してください。"
             ),
@@ -54,7 +54,7 @@ TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
                 "properties": {
                     "keyword": {
                         "type": "string",
-                        "description": "検索キーワード (英語)。例: 'juxtaglomerular apparatus'",
+                        "description": "検索キーワード (英語)。文ではなく単語・キーワードで質問するべきです。　例: 'juxtaglomerular apparatus'",
                     },
                     "size": {
                         "type": "integer",
