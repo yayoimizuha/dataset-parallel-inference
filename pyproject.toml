@@ -26,7 +26,9 @@ dependencies = [
     "unidic-lite",
     "onnxruntime-gpu",
     "polars",
-    "tensorrt"
+    "tensorrt",
+    "elasticsearch",
+    "duckdb"
 ]
 
 [build-system]
