@@ -93,8 +93,8 @@ TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
                 "type": "object",
                 "properties": {
                     "article_id": {
-                        "type": "string",
-                        "description": "英語 Wikipedia の記事 ID (数字文字列)。search_articles の結果から取得。",
+                        "type": "integer",
+                        "description": "英語 Wikipedia の記事 ID (整数)。search_articles の結果から取得。",
                     },
                 },
                 "required": ["article_id"],
@@ -116,7 +116,7 @@ async def search_articles(keyword: str, size: int = 5) -> list[dict]:
     記事 ID・タイトル・本文冒頭を返す。
 
     Returns:
-        [{"article_id": str, "title": str, "text_snippet": str, "score": float}, ...]
+        [{"article_id": int, "title": str, "text_snippet": str, "score": float}, ...]
     """
     es = _get_es_client()
     query = {
@@ -139,7 +139,7 @@ async def search_articles(keyword: str, size: int = 5) -> list[dict]:
         text_full = src.get("text", "")
         snippet = text_full[:3000] + ("..." if len(text_full) > 3000 else "")
         results.append({
-            "article_id": str(src["article_id"]),
+            "article_id": int(src["article_id"]),
             "title": src["title"],
             "text_snippet": snippet,
             "score": hit["_score"],
@@ -147,7 +147,7 @@ async def search_articles(keyword: str, size: int = 5) -> list[dict]:
     return results
 
 
-async def get_ja_article(article_id: str) -> dict:
+async def get_ja_article(article_id: int) -> dict:
     """
     英語 Wikipedia 記事 ID から対応する日本語版 Wikipedia 記事を取得する。
 
@@ -155,7 +155,7 @@ async def get_ja_article(article_id: str) -> dict:
     2. 日本語タイトルで ja_articles テーブルから本文を取得
 
     Returns:
-        {"article_id": str, "ja_title": str, "ja_text": str}
+        {"article_id": int, "ja_title": str, "ja_text": str}
         対応がない場合は {"error": "..."} を返す。
     """
     def _query() -> dict:
@@ -163,7 +163,7 @@ async def get_ja_article(article_id: str) -> dict:
         try:
             row = con.execute(
                 "SELECT ll_title FROM langlinks WHERE ll_from = ?",
-                [int(article_id)],
+                [article_id],
             ).fetchone()
             if row is None:
                 return {"error": f"article_id={article_id} に対応する日本語タイトルが見つかりません。"}
@@ -203,7 +203,7 @@ async def _dispatch_tool_call(name: str, arguments: dict) -> str:
                 size=arguments.get("size", 5),
             )
         elif name == "get_ja_article":
-            result = await get_ja_article(article_id=arguments["article_id"])
+            result = await get_ja_article(article_id=int(arguments["article_id"]))
         else:
             result = {"error": f"Unknown function: {name}"}
     except Exception as e:
@@ -329,6 +329,7 @@ class Task(InferenceTask):
                 ]
                 # Function Calling ループ: ツール呼び出しが返る限り繰り返す
                 last_resp = None
+                tool_interactions = []  # ツール呼び出しのやりとりを記録
                 for _tool_round in range(20):
                     while True:
                         try:
@@ -359,7 +360,6 @@ class Task(InferenceTask):
 
                     # 各ツール呼び出しを実行し結果を追加
                     for tool_call in choice.message.tool_calls:
-                        print(tool_call)
                         fn_name = tool_call.function.name  # type: ignore[union-attr]
                         fn_args = json.loads(tool_call.function.arguments)  # type: ignore[union-attr]
                         fn_result = await _dispatch_tool_call(fn_name, fn_args)
@@ -370,6 +370,12 @@ class Task(InferenceTask):
                                 content=fn_result,
                             )
                         )
+                        # ツール呼び出しのやりとりを記録
+                        tool_interactions.append({
+                            "round": _tool_round,
+                            "call": {"name": fn_name, "arguments": fn_args},
+                            "result": json.loads(fn_result),
+                        })
 
                 # 5ラウンド使い切り時: 最後の応答が tool_calls のままなら tools なしで最終呼び出し
                 if (last_resp is not None
@@ -391,7 +397,10 @@ class Task(InferenceTask):
                             sleep_time *= 2
 
                 _contents.append(last_resp.choices[0].message.content)  # type: ignore[union-attr]
-                _reasons.append(getattr(last_resp.choices[0].message, "reasoning_content", None))  # type: ignore[union-attr]
+                _reasons.append({
+                    "reasoning_content": getattr(last_resp.choices[0].message, "reasoning_content", None),  # type: ignore[union-attr]
+                    "tool_interactions": tool_interactions,
+                })
             updated_data = copy.deepcopy(data)
             [jsonpath_ng.parse(_pos).update(updated_data, _cont) for _cont, _pos in zip(_contents, _positions)]
             self._cur.execute("REPLACE INTO translate(id, content, loc, source, reason) VALUES (?,?,?,?,?);", (
