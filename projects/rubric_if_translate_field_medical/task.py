@@ -171,6 +171,9 @@ class Task(InferenceTask):
             timeout=aiohttp.ClientTimeout(total=60),
         )
 
+        # SQLite は同時アクセス不可なので asyncio.Lock で排他制御
+        self._db_lock = asyncio.Lock()
+
     async def _dispatch_tool_call(self, name: str, arguments: dict) -> str:
         """
         Function Calling のツール名と引数を受け取り、
@@ -339,12 +342,13 @@ class Task(InferenceTask):
                 })
             updated_data = copy.deepcopy(data)
             [jsonpath_ng.parse(_pos).update(updated_data, _cont) for _cont, _pos in zip(_contents, _positions)]
-            self._cur.execute("REPLACE INTO translate(id, content, loc, source, reason) VALUES (?,?,?,?,?);", (
-                order,
-                json.dumps(updated_data, ensure_ascii=False),
-                json.dumps(_positions, ensure_ascii=False),
-                json.dumps(data, ensure_ascii=False),
-                json.dumps(_reasons, ensure_ascii=False)
-            ))
-            self._db.commit()
+            async with self._db_lock:
+                self._cur.execute("REPLACE INTO translate(id, content, loc, source, reason) VALUES (?,?,?,?,?);", (
+                    order,
+                    json.dumps(updated_data, ensure_ascii=False),
+                    json.dumps(_positions, ensure_ascii=False),
+                    json.dumps(data, ensure_ascii=False),
+                    json.dumps(_reasons, ensure_ascii=False)
+                ))
+                self._db.commit()
             bar.update(1)
