@@ -40,10 +40,11 @@ _ES_PORT = int(os.environ.get("ES_PORT", "9200"))
 _ES_INDEX_NAME = "wikipedia_medical"
 _LANGLINKS_DB = Path(__file__).parent / "en_ja_langlinks.duckdb"
 
-# モジュールレベルで共有する非同期 ES クライアント
+# 非同期 ES クライアント
 _es_client = AsyncElasticsearch(
     hosts=[{"host": _ES_HOST, "port": _ES_PORT, "scheme": "http"}],
     request_timeout=30,
+    maxsize=256,  # aiohttp コネクションプール上限 (デフォルト 10)
 )
 
 # DuckDB は読み取り専用で共有 (クエリは数ms なのでイベントループ上で直接実行)
