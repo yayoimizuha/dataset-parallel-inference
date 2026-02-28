@@ -338,9 +338,9 @@ def load_ja_articles() -> None:
         # テーブルを再作成
         con.execute("DROP TABLE IF EXISTS ja_articles")
 
-        # HuggingFace Dataset を Arrow テーブルに変換して直接取り込み
+        # HuggingFace Dataset の内部 Arrow テーブルを直接取り込み
         print("[JA] Converting to Arrow and inserting into DuckDB...", flush=True)
-        arrow_table = ja_wiki.to_arrow()  # type: ignore[union-attr]
+        arrow_table = ja_wiki.data.table  # type: ignore[union-attr]
         con.execute("CREATE TABLE ja_articles AS SELECT * FROM arrow_table")
 
         # 確認
@@ -366,5 +366,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         test_search(" ".join(sys.argv[1:]))
     else:
-        main()
+        # main()  # ES 登録済みのためスキップ
         load_ja_articles()
