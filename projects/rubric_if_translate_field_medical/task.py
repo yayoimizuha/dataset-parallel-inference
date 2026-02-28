@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import asyncio
+import threading
 from os import path
 from os.path import dirname, basename
 from pathlib import Path
@@ -40,13 +41,13 @@ _ES_PORT = int(os.environ.get("ES_PORT", "9200"))
 _ES_INDEX_NAME = "wikipedia_medical"
 _LANGLINKS_DB = Path(__file__).parent / "en_ja_langlinks.duckdb"
 
-
-def _get_es_client() -> Elasticsearch:
-    """共通の ES クライアントを返す。"""
-    return Elasticsearch(
-        hosts=[{"host": _ES_HOST, "port": _ES_PORT, "scheme": "http"}],
-        request_timeout=30,
-    )
+# モジュールレベルで共有するクライアント (呼び出しごとの再生成を避ける)
+_es_client = Elasticsearch(
+    hosts=[{"host": _ES_HOST, "port": _ES_PORT, "scheme": "http"}],
+    request_timeout=30,
+)
+_duckdb_con = duckdb.connect(str(_LANGLINKS_DB), read_only=True)
+_duckdb_lock = threading.Lock()
 
 
 # ======================================================================
@@ -118,7 +119,6 @@ async def search_articles(keyword: str, size: int = 5) -> list[dict]:
     Returns:
         [{"article_id": int, "title": str, "text_snippet": str, "score": float}, ...]
     """
-    es = _get_es_client()
     query = {
         "query": {
             "multi_match": {
@@ -130,7 +130,7 @@ async def search_articles(keyword: str, size: int = 5) -> list[dict]:
         "size": size,
         "_source": ["article_id", "title", "text"],
     }
-    resp = await asyncio.to_thread(es.search, index=_ES_INDEX_NAME, body=query)
+    resp = await asyncio.to_thread(_es_client.search, index=_ES_INDEX_NAME, body=query)
     hits = resp["hits"]["hits"]
 
     results = []
@@ -159,35 +159,32 @@ async def get_ja_article(article_id: int) -> dict:
         対応がない場合は {"error": "..."} を返す。
     """
     def _query() -> dict:
-        con = duckdb.connect(str(_LANGLINKS_DB), read_only=True)
-        try:
-            row = con.execute(
+        with _duckdb_lock:
+            row = _duckdb_con.execute(
                 "SELECT ll_title FROM langlinks WHERE ll_from = ?",
                 [article_id],
             ).fetchone()
             if row is None:
-                return {"error": f"article_id={article_id} に対応する日本語タイトルが見つかりません。"}
+                return {"error": f"article_id={article_id} に対応する日本語記事が見つかりません。"}
             ja_title = row[0]
 
-            article_row = con.execute(
+            article_row = _duckdb_con.execute(
                 "SELECT id, title, text FROM ja_articles WHERE title = ?",
                 [ja_title],
             ).fetchone()
-            if article_row is None:
-                return {
-                    "article_id": article_id,
-                    "ja_title": ja_title,
-                    "ja_text": "(日本語記事の本文は取得できませんでした)",
-                }
-            ja_text = article_row[2]
-            ja_text = ja_text[:3000] + ("..." if len(ja_text) > 3000 else "")
+        if article_row is None:
             return {
                 "article_id": article_id,
-                "ja_title": article_row[1],
-                "ja_text": ja_text,
+                "ja_title": ja_title,
+                "ja_text": "(日本語記事の本文は取得できませんでした)",
             }
-        finally:
-            con.close()
+        ja_text = article_row[2]
+        ja_text = ja_text[:3000] + ("..." if len(ja_text) > 3000 else "")
+        return {
+            "article_id": article_id,
+            "ja_title": article_row[1],
+            "ja_text": ja_text,
+        }
 
     return await asyncio.to_thread(_query)
 
