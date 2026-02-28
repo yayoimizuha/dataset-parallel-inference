@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -103,6 +104,28 @@ class JaArticleResponse(BaseModel):
 
 app = FastAPI(title="Function Calling Server", version="1.0.0")
 
+# ======================================================================
+# キーワードサニタイズ
+# ======================================================================
+
+# 英語メタワード (検索ノイズになるもの)
+_NOISE_WORDS = re.compile(
+    r"\b(?:japanese|translation|meaning|definition|term|terms|"
+    r"in\s+japanese|translate|translated|equivalent)\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_keyword(keyword: str) -> str:
+    """検索キーワードから非ASCII文字とメタワードを除去して返す。"""
+    # 非ASCII文字を除去 (検索対象は英語版 Wikipedia のみ)
+    cleaned = re.sub(r"[^\x00-\x7F]", " ", keyword)
+    # 英語メタワードを除去
+    cleaned = _NOISE_WORDS.sub("", cleaned)
+    # 連続空白を1つにまとめ、前後の空白を除去
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or keyword  # 全部消えた場合は元のキーワードをそのまま使う
+
 
 @app.middleware("http")
 async def access_log(request: Request, call_next) -> Response:
@@ -128,11 +151,16 @@ def health():
 @app.post("/search_articles", response_model=SearchResponse)
 def search_articles(req: SearchRequest):
     """Elasticsearch で英語版 Wikipedia 医学記事を全文検索する。"""
-    logger.info("search_articles  keyword=%r  size=%d", req.keyword, req.size)
+    raw_keyword = req.keyword
+    keyword = _sanitize_keyword(raw_keyword)
+    if keyword != raw_keyword:
+        logger.info("search_articles  keyword=%r -> sanitized=%r  size=%d", raw_keyword, keyword, req.size)
+    else:
+        logger.info("search_articles  keyword=%r  size=%d", keyword, req.size)
     query = {
         "query": {
             "multi_match": {
-                "query": req.keyword,
+                "query": keyword,
                 "fields": ["title^3", "text"],
                 "type": "best_fields",
             },
