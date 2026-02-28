@@ -340,6 +340,7 @@ class Task(InferenceTask):
                                 tool_choice="auto",
                                 # reasoning_effort="high",
                             )
+                            print(last_resp.choices[0].message.tool_calls or last_resp.choices[0].message.content)
                             break
                         except (OpenAIError, ValueError) as e:
                             print(f"OpenAI API Error: {e}")
