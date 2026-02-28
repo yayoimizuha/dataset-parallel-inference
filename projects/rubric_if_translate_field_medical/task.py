@@ -17,7 +17,7 @@ import jsonpath_ng
 import tqdm
 from datasets import load_dataset
 from dotenv import load_dotenv
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError, DefaultAioHttpClient
 from openai.types.chat import (
     ChatCompletionUserMessageParam,
     ChatCompletionAssistantMessageParam,
@@ -139,12 +139,9 @@ class Task(InferenceTask):
             api_key=os.environ["API_KEY"],
             base_url=os.environ["BASE_URL"],
             timeout=None,
-            http_client=DefaultAsyncHttpxClient(
-                limits=httpx.Limits(
-                    max_connections=8192,
-                    max_keepalive_connections=8192,
-                ),
-            ),
+            http_client=DefaultAioHttpClient(
+                limits=httpx.Limits(max_connections=8192, max_keepalive_connections=8192),
+            )
         )
         self.function_definitions = _parse_function_definitions(
             Path(__file__).parent.joinpath("functions").glob("*.py"))
@@ -164,7 +161,7 @@ class Task(InferenceTask):
         self._http_session: aiohttp.ClientSession = aiohttp.ClientSession(
             base_url=_FUNCTION_SERVER_BASE,
             connector=aiohttp.TCPConnector(
-                limit=8192,              # 同時接続数上限
+                limit=8192,  # 同時接続数上限
                 enable_cleanup_closed=True,
             ),
         )

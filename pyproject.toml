@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "torch",
     "datasets",
-    "openai",
+    "openai[aiohttp]",
     "python-dotenv",
     "tqdm",
     "sglang; sys_platform == 'linux'",
