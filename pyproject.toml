@@ -28,7 +28,8 @@ dependencies = [
     "polars",
     "tensorrt",
     "elasticsearch",
-    "duckdb"
+    "duckdb",
+    "fastapi",
 ]
 
 [build-system]

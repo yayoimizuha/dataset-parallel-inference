@@ -10,12 +10,11 @@ from os.path import dirname, basename
 from pathlib import Path
 from typing import Iterator
 
-import duckdb
+import aiohttp
 import jsonpath_ng
 import tqdm
 from datasets import load_dataset
 from dotenv import load_dotenv
-from elasticsearch import AsyncElasticsearch
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import (
     ChatCompletionUserMessageParam,
@@ -28,28 +27,13 @@ from openai.types.chat import (
 from core import InferenceTask
 from asyncio import Semaphore
 
-
 # ======================================================================
-# Elasticsearch / DuckDB 設定
+# Function Server 設定
 # ======================================================================
 
 load_dotenv(Path(__file__).parent / ".env")
 
-_ES_HOST = os.environ.get("ES_HOST", "localhost")
-_ES_PORT = int(os.environ.get("ES_PORT", "9200"))
-_ES_INDEX_NAME = "wikipedia_medical"
-_LANGLINKS_DB = Path(__file__).parent / "en_ja_langlinks.duckdb"
-
-# 非同期 ES クライアント
-_es_client = AsyncElasticsearch(
-    hosts=[{"host": _ES_HOST, "port": _ES_PORT, "scheme": "http"}],
-    request_timeout=30,
-    connections_per_node=int(1e4),  # ノードあたりの接続プール上限
-)
-
-# DuckDB は読み取り専用で共有 (クエリは数ms なのでイベントループ上で直接実行)
-_duckdb_con = duckdb.connect(str(_LANGLINKS_DB), read_only=True)
-
+_FUNCTION_SERVER_BASE = os.environ.get("FUNCTION_SERVER_URL", "http://localhost:8100")
 
 # ======================================================================
 # Function Calling 用ツール定義
@@ -108,104 +92,6 @@ TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
 
 
 # ======================================================================
-# Function Calling 用の実関数
-# ======================================================================
-
-
-async def search_articles(keyword: str, size: int = 5) -> list[dict]:
-    """
-    Elasticsearch で英語版 Wikipedia 医学記事を全文検索し、
-    記事 ID・タイトル・本文冒頭を返す。
-
-    Returns:
-        [{"article_id": int, "title": str, "text_snippet": str, "score": float}, ...]
-    """
-    query = {
-        "query": {
-            "multi_match": {
-                "query": keyword,
-                "fields": ["title^3", "text"],
-                "type": "best_fields",
-            },
-        },
-        "size": size,
-        "_source": ["article_id", "title", "text"],
-    }
-    resp = await _es_client.search(index=_ES_INDEX_NAME, body=query)
-    hits = resp["hits"]["hits"]
-
-    results = []
-    for hit in hits:
-        src = hit["_source"]
-        text_full = src.get("text", "")
-        snippet = text_full[:3000] + ("..." if len(text_full) > 3000 else "")
-        results.append({
-            "article_id": int(src["article_id"]),
-            "title": src["title"],
-            "text_snippet": snippet,
-            "score": hit["_score"],
-        })
-    return results
-
-
-async def get_ja_article(article_id: int) -> dict:
-    """
-    英語 Wikipedia 記事 ID から対応する日本語版 Wikipedia 記事を取得する。
-
-    1. DuckDB の langlinks テーブルで英語記事 ID → 日本語タイトルを引く
-    2. 日本語タイトルで ja_articles テーブルから本文を取得
-
-    Returns:
-        {"article_id": int, "ja_title": str, "ja_text": str}
-        対応がない場合は {"error": "..."} を返す。
-    """
-    row = _duckdb_con.execute(
-        "SELECT ll_title FROM langlinks WHERE ll_from = ?",
-        [article_id],
-    ).fetchone()
-    if row is None:
-        return {"error": f"article_id={article_id} に対応する日本語記事が見つかりません。"}
-    ja_title = row[0]
-
-    article_row = _duckdb_con.execute(
-        "SELECT id, title, text FROM ja_articles WHERE title = ?",
-        [ja_title],
-    ).fetchone()
-    if article_row is None:
-        return {
-            "article_id": article_id,
-            "ja_title": ja_title,
-            "ja_text": "(日本語記事の本文は取得できませんでした)",
-        }
-    ja_text = article_row[2]
-    ja_text = ja_text[:3000] + ("..." if len(ja_text) > 3000 else "")
-    return {
-        "article_id": article_id,
-        "ja_title": article_row[1],
-        "ja_text": ja_text,
-    }
-
-
-async def _dispatch_tool_call(name: str, arguments: dict) -> str:
-    """
-    Function Calling のツール名と引数を受け取り、結果を JSON 文字列で返す。
-    """
-    try:
-        if name == "search_articles":
-            result = await search_articles(
-                keyword=arguments["keyword"],
-                size=arguments.get("size", 5),
-            )
-        elif name == "get_ja_article":
-            result = await get_ja_article(article_id=int(arguments["article_id"]))
-        else:
-            result = {"error": f"Unknown function: {name}"}
-    except Exception as e:
-        result = {"error": f"{type(e).__name__}: {e}"}
-    return json.dumps(result, ensure_ascii=False)
-
-
-# ======================================================================
 # 既存ユーティリティ
 # ======================================================================
 
@@ -253,7 +139,7 @@ class Task(InferenceTask):
         self.dataset = load_dataset("NovelHacja/RubricHub_v1_config", "medical", split="train",
                                     streaming=False)
         load_dotenv(path.join(dirname(__file__), ".env"))
-        
+
         if "/" not in os.environ["MODEL_NAME"]:
             model_provider_text = ""
             model_name = os.environ["MODEL_NAME"]
@@ -261,6 +147,39 @@ class Task(InferenceTask):
             model_provider, model_name = os.environ["MODEL_NAME"].split("/")[:2]
             model_provider_text = f"{model_provider}製の"
         self._system_prompt = f"あなたは{model_provider_text}大規模言語モデル、{model_name}です。広範な知識を伴う言語理解力やユーザ指示への忠実性に秀でており、完全な回答を提供します。"
+
+        # aiohttp セッション (イベントループ起動後に遅延初期化)
+        self._http_session: aiohttp.ClientSession = aiohttp.ClientSession(
+            base_url=_FUNCTION_SERVER_BASE,
+            connector=aiohttp.TCPConnector(limit=0),
+            timeout=aiohttp.ClientTimeout(total=60),
+        )
+
+    async def _dispatch_tool_call(self, name: str, arguments: dict) -> str:
+        """
+        Function Calling のツール名と引数を受け取り、
+        function_server の対応エンドポイントに POST し、結果を JSON 文字列で返す。
+        """
+        try:
+            if name == "search_articles":
+                payload = {
+                    "keyword": arguments["keyword"],
+                    "size": arguments.get("size", 5),
+                }
+                async with self._http_session.post("/search_articles", json=payload) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                result = data.get("results", data)
+            elif name == "get_ja_article":
+                payload = {"article_id": int(arguments["article_id"])}
+                async with self._http_session.post("/get_ja_article", json=payload) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+            else:
+                result = {"error": f"Unknown function: {name}"}
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+        return json.dumps(result, ensure_ascii=False)
 
     def get_length(self) -> int:
         return self.dataset.info.splits["train"].num_examples
@@ -337,7 +256,9 @@ class Task(InferenceTask):
                             # print(last_resp.choices[0].message.tool_calls or last_resp.choices[0].message.content)
                             break
                         except (OpenAIError, ValueError) as e:
-                            print(f"OpenAI API Error: {e}")
+                            cause = e.__cause__
+                            print(f"order[{order}]: OpenAI API Error: {e}"
+                                  + (f" caused by {type(cause).__name__}: {cause}" if cause else ""))
                             if sleep_time > 32.0:
                                 bar.update(1)
                                 return
@@ -357,7 +278,7 @@ class Task(InferenceTask):
                     for tool_call in choice.message.tool_calls:
                         fn_name = tool_call.function.name  # type: ignore[union-attr]
                         fn_args = json.loads(tool_call.function.arguments)  # type: ignore[union-attr]
-                        fn_result = await _dispatch_tool_call(fn_name, fn_args)
+                        fn_result = await self._dispatch_tool_call(fn_name, fn_args)
                         messages.append(
                             ChatCompletionToolMessageParam(
                                 role="tool",
@@ -384,16 +305,20 @@ class Task(InferenceTask):
                             )
                             break
                         except (OpenAIError, ValueError) as e:
-                            print(f"OpenAI API Error: {e}")
+                            cause = e.__cause__
+                            print(f"order[{order}]: OpenAI API Error: {e}"
+                                  + (f" caused by {type(cause).__name__}: {cause}" if cause else ""))
                             if sleep_time > 32.0:
                                 bar.update(1)
                                 return
                             await asyncio.sleep(sleep_time)
                             sleep_time *= 2
 
-                _contents.append(last_resp.choices[0].message.content or "")  # type: ignore[union-attr]
+                _contents.append(
+                    last_resp.choices[0].message.content or "<-- output is missing -->")  # type: ignore[union-attr]
                 _reasons.append({
-                    "reasoning_content": getattr(last_resp.choices[0].message, "reasoning_content", None),  # type: ignore[union-attr]
+                    "reasoning_content": getattr(last_resp.choices[0].message, "reasoning_content", None),
+                    # type: ignore[union-attr]
                     "tool_interactions": tool_interactions,
                 })
             updated_data = copy.deepcopy(data)
