@@ -211,6 +211,13 @@ class Task(InferenceTask):
         self._cur.close()
         self._db.close()
 
+    async def close(self) -> None:
+        """非同期リソース (aiohttp セッション, OpenAI httpx クライアント) をクローズする。"""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+        if self._client and hasattr(self._client, "close"):
+            await self._client.close()
+
     async def process(self, data, order: int, sem: Semaphore, bar: tqdm.tqdm):
         # id列に order の値が存在するか確認、したらスキップ
         data = data["extra_info"].copy()

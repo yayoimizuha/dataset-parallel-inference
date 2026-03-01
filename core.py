@@ -23,3 +23,7 @@ class InferenceTask(ABC):
     @abstractmethod
     async def process(self, data, order: int, sem: Semaphore, bar: tqdm.tqdm):
         pass
+
+    async def close(self) -> None:
+        """非同期リソースのクリーンアップ。サブクラスで必要に応じてオーバーライドする。"""
+        pass

@@ -34,6 +34,7 @@ async def main():
             while task_queue.__len__() > args.concurrency * 1.5:
                 _, task_queue = await asyncio.wait(task_queue, timeout=3)
     await asyncio.wait(task_queue)
+    await task.close()
 
 
 if __name__ == "__main__":
