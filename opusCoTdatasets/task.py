@@ -215,7 +215,8 @@ class Task(InferenceTask):
                 _reasons.append(resp_1.choices[0].message.content)
                 _reasons.append(resp_2.choices[0].message.content)
             updated_data = copy.deepcopy(data)
-            [jsonpath_ng.parse(_pos).update(updated_data, _cont) for _cont, _pos in zip(_contents, _positions)]
+            for _cont, _pos in zip(_contents, _positions):
+                jsonpath_ng.parse(_pos).update(updated_data, _cont)
             self._cur.execute("REPLACE INTO translate(id, content, loc, source, reason) VALUES (?,?,?,?,?);", (
                 order,
                 json.dumps(updated_data, ensure_ascii=False),
