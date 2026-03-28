@@ -26,10 +26,11 @@ dependencies = [
     "unidic-lite",
     "onnxruntime-gpu",
     "polars",
-    "tensorrt",
+    "tensorrt; sys_platform == 'linux'",
     "elasticsearch",
     "duckdb",
     "fastapi[standard]",
+    "langfuse"
 ]
 
 [build-system]
@@ -37,7 +38,8 @@ requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
-override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29", "xgrammar==0.1.31","torch"]
+override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29", "xgrammar==0.1.31", "torch"]
+environments = ["sys_platform == 'win32'"]
 
 [tool.uv.sources]
 sglang = { git = "https://github.com/sgl-project/sglang.git", subdirectory = "python", branch = "main" }
@@ -54,4 +56,4 @@ flash_attn = ["torch", "einops", "ninja", "setuptools"]
 [tool.uv.extra-build-variables]
 "flash_attn" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
 "vllm" = { TORCH_CUDA_ARCH_LIST = "9.0", MAX_JOBS = "64" }
-"tensorrt" = { NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP = "0"}
+"tensorrt" = { NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP = "0" }
